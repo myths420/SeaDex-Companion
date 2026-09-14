@@ -17,6 +17,7 @@ export interface Config extends JsonObject {
   radarr_key: string
   sonarr_category: string
   radarr_category: string
+  sonarr_unmonitor_best: boolean
   qbittorrent_url: string
   qbittorrent_user: string
   qbittorrent_pass: string

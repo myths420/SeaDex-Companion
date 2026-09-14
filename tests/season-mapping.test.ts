@@ -8,7 +8,7 @@ import {
   anilistChain, applyUserRulesToResults, arrApiUrl, arrBaseUrl, arrItemUrl, autoNotifyNew, autocheckState, buildScanHistoryEntry, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, commonBestRelease, decryptSecretValues, describeResultChange, discordMessageBody, DEFAULT_CONFIG, effectiveSeasonParts,
   encryptSecretValues, findProwlarrRelease, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
   qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, releaseDict, scopeReleaseToPart, seadexBest,
-  resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, testIntegration,
+  resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, syncSonarrSeasonMonitoring, testIntegration,
 } from '../server/app.js'
 import { nextScheduledTime, parseReleaseIndex, processAutocheck, processWebhookScans, queueWebhookScan, refreshAutocheckSchedule, resetWebhookScanState, webhookScanState } from '../server/index.js'
 import type { JsonObject, ReleaseCandidate, ScanTrigger } from '../server/types.js'
@@ -1296,6 +1296,53 @@ describe('Prowlarr fallback for private-tracker releases', () => {
     try {
       const result = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group' }, 1)
       assert.equal(result, null)
+    } finally { restore() }
+  })
+})
+
+describe('Sonarr season monitoring sync', () => {
+  const sonarrConfig = { ...DEFAULT_CONFIG, sonarr_url: 'http://sonarr/api/v3', sonarr_key: 'key' }
+  const bestResult = { arr: 'Sonarr', status: 'best', season: 2, library_key: 'Sonarr:item42' }
+
+  function mockSeries(seasons: { seasonNumber: number; monitored: boolean }[]) {
+    const originalFetch = globalThis.fetch
+    const requests: { method: string; body?: string }[] = []
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ method: init?.method || 'GET', body: init?.body as string | undefined })
+      if (init?.method === 'PUT') return new Response('{}', { status: 200 })
+      assert.match(url, /\/series\/42$/)
+      return new Response(JSON.stringify({ id: 42, title: 'Some Show', monitored: true, seasons: seasons.map((s) => ({ ...s })) }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+    return { requests, restore: () => { globalThis.fetch = originalFetch } }
+  }
+
+  test('unmonitors only the matched season, leaving the series and other seasons alone', async () => {
+    const { requests, restore } = mockSeries([{ seasonNumber: 1, monitored: true }, { seasonNumber: 2, monitored: true }])
+    try {
+      await syncSonarrSeasonMonitoring(sonarrConfig, [bestResult])
+      const put = requests.find((r) => r.method === 'PUT')
+      assert.ok(put, 'expected a PUT to update the series')
+      const body = JSON.parse(put!.body!)
+      assert.equal(body.monitored, true, 'series-level monitored must stay untouched')
+      assert.equal(body.seasons.find((s: any) => s.seasonNumber === 1).monitored, true, 'season 1 must be untouched')
+      assert.equal(body.seasons.find((s: any) => s.seasonNumber === 2).monitored, false, 'season 2 must be unmonitored')
+    } finally { restore() }
+  })
+
+  test('does not PUT when the season is already unmonitored', async () => {
+    const { requests, restore } = mockSeries([{ seasonNumber: 2, monitored: false }])
+    try {
+      await syncSonarrSeasonMonitoring(sonarrConfig, [bestResult])
+      assert.equal(requests.some((r) => r.method === 'PUT'), false)
+    } finally { restore() }
+  })
+
+  test('does nothing when sonarr_unmonitor_best is disabled', async () => {
+    const { requests, restore } = mockSeries([{ seasonNumber: 2, monitored: true }])
+    try {
+      await syncSonarrSeasonMonitoring({ ...sonarrConfig, sonarr_unmonitor_best: false }, [bestResult])
+      assert.equal(requests.length, 0)
     } finally { restore() }
   })
 })

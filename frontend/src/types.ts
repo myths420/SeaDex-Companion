@@ -121,6 +121,7 @@ export interface Config {
   radarr_key_configured: boolean
   sonarr_category: string
   radarr_category: string
+  sonarr_unmonitor_best: boolean
   qbittorrent_url: string
   qbittorrent_user: string
   qbittorrent_pass: string

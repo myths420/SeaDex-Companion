@@ -32,6 +32,7 @@ export const DEFAULT_CONFIG: Config = {
   radarr_key: '',
   sonarr_category: 'sonarr-anime',
   radarr_category: 'radarr-anime',
+  sonarr_unmonitor_best: true,
   qbittorrent_url: '',
   qbittorrent_user: '',
   qbittorrent_pass: '',
@@ -1395,6 +1396,55 @@ export interface ScanDependencies {
   autoNotifyNew?: typeof autoNotifyNew
   loadUserRules?: typeof loadUserRules
   recordScanHistory?: (previous: JsonObject[], current: JsonObject[], runAt: string, file?: string, trigger?: ScanTrigger, metadata?: { durationSeconds?: number; scannedTitles?: number; sourceErrors?: Record<string, string>; outcome?: ScanHistoryEntry['outcome']; error?: string }) => ScanHistoryEntry
+  syncSonarrSeasonMonitoring?: typeof syncSonarrSeasonMonitoring
+}
+
+/**
+ * Unmonitors (in Sonarr) any season this scan just tagged "best quality" -
+ * Sonarr's own search/upgrade behavior would otherwise be free to replace a
+ * release the user is already happy with. Only the season is touched; the
+ * series' own monitored flag is left alone so new seasons still get picked
+ * up. This is one-way by design: a season stays unmonitored even if a later
+ * scan finds an even better release - re-monitoring it is left to the user,
+ * the same way they'd have to notice and act on a Sonarr-only upgrade today.
+ */
+export async function syncSonarrSeasonMonitoring(config: Config, results: JsonObject[]): Promise<void> {
+  if (!config.sonarr_url || !config.sonarr_key || config.sonarr_unmonitor_best === false) return
+  const seasonsBySeries = new Map<number, Set<number>>()
+  for (const result of results) {
+    if (result.arr !== 'Sonarr' || result.status !== 'best') continue
+    const season = Number(result.season)
+    if (!Number.isInteger(season) || season <= 0) continue
+    const match = String(result.library_key || '').match(/^Sonarr:item(\d+)$/)
+    if (!match) continue
+    const seriesId = Number(match[1])
+    const seasons = seasonsBySeries.get(seriesId) || new Set<number>()
+    seasons.add(season)
+    seasonsBySeries.set(seriesId, seasons)
+  }
+  const base = arrApiUrl(config.sonarr_url)
+  for (const [seriesId, seasons] of seasonsBySeries) {
+    try {
+      const series = await api(`${base}/series/${seriesId}`, config.sonarr_key)
+      let changed = false
+      for (const season of series.seasons || []) {
+        if (seasons.has(Number(season.seasonNumber)) && season.monitored) { season.monitored = false; changed = true }
+      }
+      if (!changed) continue
+      const response = await fetchWithTimeout(`${base}/series/${seriesId}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.sonarr_key },
+        body: JSON.stringify(series),
+      }, 30_000)
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 160)
+        throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`)
+      }
+      const seasonLabels = [...seasons].sort((left, right) => left - right).map((season) => `S${String(season).padStart(2, '0')}`).join(', ')
+      log('INFO', `Unmonitored ${seasonLabels} for "${series.title}" in Sonarr (already have the best release)`)
+    } catch (error) {
+      log('WARNING', `Could not update Sonarr season monitoring for series ${seriesId}: ${errorMessage(error)}`)
+    }
+  }
 }
 
 export async function runScan(config: Config | JsonObject, dependencies: ScanDependencies = {}, trigger: ScanTrigger = 'manual', scope: ScanScope = {}): Promise<void> {
@@ -1577,6 +1627,11 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
     stage = 'sending notifications'
     if (!Object.keys(sourceErrors).length) await (dependencies.autoNotifyNew || autoNotifyNew)(config as Config, { previous: previousResults })
     else log('WARNING', `Notifications skipped after partial scan: ${Object.keys(sourceErrors).join(', ')} unavailable`)
+    stage = 'syncing Sonarr season monitoring'
+    if (!sourceErrors.Sonarr) {
+      try { await (dependencies.syncSonarrSeasonMonitoring || syncSonarrSeasonMonitoring)(config as Config, finalResults) }
+      catch (error) { log('WARNING', `Could not sync Sonarr season monitoring: ${errorMessage(error)}`) }
+    }
     const statusCounts = finalResults.reduce<Record<string, number>>((counts, result) => {
       const status = String(result.status || 'unknown')
       counts[status] = (counts[status] || 0) + 1
