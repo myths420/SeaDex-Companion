@@ -2215,51 +2215,58 @@ export interface QbOwnershipHooks {
   forget: (hash: string) => void
 }
 
-async function qbCategoryHashes(config: Config, category?: string): Promise<Set<string>> {
-  const response = await qbRequest(config, `/api/v2/torrents/info${category ? `?category=${encodeURIComponent(category)}` : ''}`)
-  if (response.status !== 200) return new Set()
-  try { return new Set((JSON.parse(await response.text()) as JsonObject[]).map((torrent) => String(torrent.hash || '').toLowerCase())) }
-  catch { return new Set() }
+async function qbFindByTag(config: Config, tag: string): Promise<string | null> {
+  const response = await qbRequest(config, `/api/v2/torrents/info?tag=${encodeURIComponent(tag)}`)
+  if (response.status !== 200) return null
+  try {
+    const torrents = JSON.parse(await response.text()) as JsonObject[]
+    return torrents[0] ? (String(torrents[0].hash || '').toLowerCase() || null) : null
+  } catch { return null }
 }
 
 /**
- * A magnet URI carries its own hash, but a Prowlarr `downloadUrl` is a link
- * to an actual .torrent file - qBittorrent doesn't know its hash until it has
+ * A magnet URI carries its own hash, but a Prowlarr `downloadUrl` is a link to
+ * an actual .torrent file - qBittorrent doesn't know its hash until it has
  * fetched and parsed that file, which happens asynchronously after
- * /torrents/add already returned. Poll the category's torrent list for a hash
- * that wasn't there before the add to find it. Unlike the metadata wait, this
- * only needs the torrent to exist in qBittorrent's list, not to have resolved
- * peers/files yet, so it resolves in a couple of seconds.
+ * /torrents/add already returned, and plenty of indexers don't report
+ * infoHash in their search results either. Worse, /torrents/add returns
+ * "Ok." even when the given URL couldn't actually be fetched at all
+ * (confirmed by hand: a 200 "added" response for a link that produced no
+ * torrent whatsoever) - so diffing the target category's torrent list before
+ * and after isn't reliable either, since anything else landing in that same
+ * (often busy, shared with Sonarr's own downloads) category in that window
+ * gets mistaken for this one. Tagging this specific add with a one-off marker
+ * and polling for a torrent carrying it is unambiguous regardless of what
+ * else is happening in the category; a hash never appearing within budget
+ * means the add genuinely did nothing despite qBittorrent's "Ok."
  */
-async function qbResolveAddedHash(config: Config, category: string | undefined, beforeHashes: Set<string>, timeoutMs = 15_000): Promise<string | null> {
+async function qbResolveAddedHash(config: Config, tag: string, timeoutMs = 8_000): Promise<string | null> {
   const deadline = Date.now() + timeoutMs
   let pollDelay = 200
   while (Date.now() < deadline) {
-    const current = await qbCategoryHashes(config, category)
-    const fresh = [...current].find((hash) => !beforeHashes.has(hash))
-    if (fresh) return fresh
+    const hash = await qbFindByTag(config, tag)
+    if (hash) return hash
     await sleep(pollDelay)
     pollDelay = Math.min(pollDelay * 2, 2000)
   }
   return null
 }
 
-/** Resolves to the torrent's info hash - the caller's own knownHash/magnet if available, otherwise whatever qbResolveAddedHash discovers after the add (see its comment). Null only if it could genuinely not be determined. */
+/** Resolves to the torrent's info hash - the caller's own knownHash/magnet if available, otherwise whatever qbResolveAddedHash discovers after the add (see its comment). Throws if the add can't be confirmed to have actually happened. */
 export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<string | null> {
   // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
   // release, which magnetInfoHash() can't parse a hash out of - the caller
   // passes the hash it already has (from Prowlarr's search result) instead.
   let hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
   if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
+  const resolveTag = hash ? null : `seadex-resolve-${randomBytes(4).toString('hex')}`
   // Only the duplicate-check-then-add is under the lock (brief - this is what
   // actually needs to be atomic, to stop two concurrent adds of the same hash
   // both passing the check). The metadata wait that can follow does not hold
   // it - see qbSelectTorrentFiles.
-  let beforeHashes: Set<string> | null = null
   await withQbLock(async () => {
     if (hash && await qbTorrentExists(config, hash)) throw new Error('Torrent already exists in qBittorrent and was not marked as app-owned')
-    if (!hash) beforeHashes = await qbCategoryHashes(config, category)
-    const body = new URLSearchParams({ urls: magnet, tags: 'seadex' }); if (category) body.set('category', category)
+    const body = new URLSearchParams({ urls: magnet, tags: resolveTag ? `seadex,${resolveTag}` : 'seadex' }); if (category) body.set('category', category)
     if (selectedFiles.length) { body.set('paused', 'true'); body.set('stopped', 'true') }
     const response = await qbRequest(config, '/api/v2/torrents/add', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })
     const text = await response.text()
@@ -2270,8 +2277,8 @@ export async function qbAddTorrent(config: Config, magnet: string, category?: st
     if (!accepted) throw new Error(`qBittorrent rejected the torrent (HTTP ${response.status}: ${text.slice(0, 120)})`)
   })
   if (!hash) {
-    hash = await qbResolveAddedHash(config, category, beforeHashes || new Set())
-    if (!hash) log('WARNING', `Added a torrent via ${category || 'no'} category but could not determine its info hash afterward - ownership tracking, dedupe, and progress display won't work for it`)
+    hash = await qbResolveAddedHash(config, resolveTag!)
+    if (!hash) throw new Error('qBittorrent reported the torrent as added, but it never actually appeared - the source link may be invalid, expired, or unreachable')
   }
   try {
     if (hash) ownership?.record(hash)

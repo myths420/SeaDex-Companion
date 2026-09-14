@@ -840,6 +840,37 @@ describe('qBittorrent torrent controls', () => {
     }
   })
 
+  test('fails loudly when qBittorrent says "Ok" but never actually adds anything', async () => {
+    // Real observed case: qBittorrent's /torrents/add returned a plain 200
+    // "Ok." for a link that produced no torrent at all (expired/invalid
+    // source link) - nothing ever showed up in qBittorrent, but the old
+    // category-diffing approach could still spuriously "resolve" some
+    // unrelated torrent that happened to land in the same shared category
+    // around the same time, reporting false success. Tag-based resolution
+    // must instead report this as the failure it actually is.
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/api/v2/auth/login')) return new Response('Ok.', { status: 200 })
+      if (url.includes('/api/v2/torrents/info')) return new Response('[]', { status: 200 }) // never appears
+      if (url.endsWith('/api/v2/torrents/add')) return new Response('Ok.', { status: 200 })
+      return new Response('', { status: 200 })
+    }) as typeof fetch
+    try {
+      // qbResolveAddedHash's own budget (8s, unrelated to the metadata-wait
+      // timeoutMs param) is what's actually being waited out here.
+      await assert.rejects(
+        () => qbAddTorrent(
+          { ...DEFAULT_CONFIG, qbittorrent_url: 'http://qb.example', qbittorrent_user: 'admin', qbittorrent_pass: 'secret' },
+          'https://prowlarr.example/download/dead-link', 'anime',
+        ),
+        /never actually appeared/,
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('rejects misleading qBittorrent login responses', async () => {
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async () => new Response('Not Ok', { status: 200 })) as typeof fetch
