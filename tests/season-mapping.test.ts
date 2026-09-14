@@ -7,7 +7,7 @@ import { beforeEach, describe, test } from 'node:test'
 import {
   anilistChain, applyUserRulesToResults, arrApiUrl, arrBaseUrl, arrItemUrl, autoNotifyNew, autocheckState, buildScanHistoryEntry, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, commonBestRelease, decryptSecretValues, describeResultChange, discordMessageBody, DEFAULT_CONFIG, effectiveSeasonParts,
   encryptSecretValues, findProwlarrRelease, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
-  mergeComplementaryCandidates, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, releaseDict, scopeReleaseToPart, seadexBest,
+  buildMagnet, mergeComplementaryCandidates, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, releaseDict, scopeReleaseToPart, seadexBest,
   resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, syncSonarrSeasonMonitoring, testIntegration,
 } from '../server/app.js'
 import { nextScheduledTime, parseReleaseIndex, processAutocheck, processWebhookScans, queueWebhookScan, refreshAutocheckSchedule, resetWebhookScanState, webhookScanState } from '../server/index.js'
@@ -823,6 +823,44 @@ describe('qBittorrent torrent controls', () => {
     try {
       await assert.rejects(() => testIntegration({ ...DEFAULT_CONFIG, sonarr_url: 'http://sonarr.example', sonarr_key: 'secret' }, 'sonarr'), /HTTP 302/)
       assert.equal(redirect, 'manual')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('buildMagnet adds a display name and well-known trackers to a bare hash', () => {
+    const hash = 'a'.repeat(40)
+    const magnet = buildMagnet(hash, 'Some Anime S01')
+    assert.match(magnet, new RegExp(`^magnet:\\?xt=urn:btih:${hash}&dn=`))
+    assert.ok(magnet.includes(encodeURIComponent('Some Anime S01')))
+    const trackerCount = (magnet.match(/&tr=/g) || []).length
+    assert.ok(trackerCount >= 3, `expected several &tr= trackers, got ${trackerCount}`)
+  })
+
+  test('does not hold the qBittorrent lock for the whole metadata wait - other calls can interleave', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/api/v2/auth/login')) return new Response('Ok.', { status: 200, headers: { 'Set-Cookie': 'SID=test; Path=/' } })
+      if (url.endsWith('/api/v2/torrents/add')) return new Response('Ok.', { status: 200 })
+      if (url.includes('/api/v2/torrents/info')) return new Response('[]', { status: 200 })
+      if (url.includes('/api/v2/torrents/files?')) return new Response('[]', { status: 200 }) // metadata never arrives
+      return new Response('', { status: 200 })
+    }) as typeof fetch
+    const config = { ...DEFAULT_CONFIG, qbittorrent_url: 'http://qb.example', qbittorrent_user: 'admin', qbittorrent_pass: 'secret' }
+    const start = Date.now()
+    try {
+      await Promise.all([
+        assert.rejects(
+          () => qbAddTorrent(config, `magnet:?xt=urn:btih:${'f'.repeat(40)}`, 'sonarr-anime', ['Show.S01E01.mkv'], 1_500),
+          /metadata fetching failed/i,
+        ),
+        (async () => {
+          await qbGetTorrents(config)
+          const elapsed = Date.now() - start
+          assert.ok(elapsed < 800, `qbGetTorrents should not be blocked behind the other download's metadata wait, took ${elapsed}ms`)
+        })(),
+      ])
     } finally {
       globalThis.fetch = originalFetch
     }

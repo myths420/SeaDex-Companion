@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetOwnedTorrents,
+  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetOwnedTorrents,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
   resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
@@ -62,6 +62,10 @@ function findResult(key: string, releaseIndex: number): { result?: JsonObject; r
 
 function clientAddress(request: IncomingMessage): string {
   return request.socket.remoteAddress || 'unknown'
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function resultLabel(result: JsonObject): string {
@@ -490,26 +494,52 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       record: (ownedHash: string) => recordOwnedTorrents([ownedHash]),
       forget: (ownedHash: string) => forgetOwnedTorrents([ownedHash]),
     }
-    try {
+    const operation = (async () => {
       if (prowlarrMatch) {
         const link = prowlarrMatch.magnetUrl || prowlarrMatch.downloadUrl!
         await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
       } else {
-        // A bare magnet has nothing for qBittorrent to show but the raw
-        // info-hash until real metadata arrives - a magnet copied by hand
-        // usually carries the tracker's own &dn= (display name), which is why
-        // that shows a proper name immediately and this didn't. Add one so
-        // the torrent reads as this release from the moment it's added,
-        // metadata timing notwithstanding.
-        const displayName = encodeURIComponent(resultLabel(found.result!))
-        for (const hash of hashes) await qbAddTorrent(config, `magnet:?xt=urn:btih:${hash}&dn=${displayName}`, category, selectedFiles, undefined, ownership)
+        // A bare magnet:?xt=urn:btih:<hash> has no display name and, more
+        // importantly, no tracker announce URLs at all - qBittorrent can only
+        // find peers by crawling DHT/PEX, which can take a long time even for
+        // a healthy swarm (confirmed by hand: the identical hash finds peers
+        // immediately when pasted into qBittorrent directly, because a magnet
+        // copied from a tracker site carries its own &tr= trackers and &dn=
+        // name). buildMagnet adds a real display name plus a handful of
+        // well-known public trackers most releases are already announced to,
+        // so this behaves like the manually-pasted case instead of relying on
+        // DHT alone.
+        const displayName = resultLabel(found.result!)
+        for (const hash of hashes) await qbAddTorrent(config, buildMagnet(hash, displayName), category, selectedFiles, undefined, ownership)
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      log('ERROR', `Download failed after ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (${message})`)
-      return sendJson(response, 502, { ok: false, error: message })
+    })()
+    const logOutcome = (error: unknown) => {
+      if (error) log('ERROR', `Download failed after ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (${errorMessage(error)})`)
+      else log('INFO', `Download added in ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (tracked torrents: ${ownedTorrentsSnapshot().length})`)
     }
-    log('INFO', `Download added in ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (tracked torrents: ${ownedTorrentsSnapshot().length})`)
+    // The metadata wait behind this can now take up to an hour (QB_METADATA_TIMEOUT_MS).
+    // Blocking this request's connection for that long risks a reverse-proxy
+    // timeout regardless of how the backend behaves. A slow-but-real failure
+    // (duplicate torrent, rejected by qBittorrent) still shows up as an error
+    // here as long as it happens within the fast-path window; once past it,
+    // this responds success and lets the operation keep running - Server Log
+    // and the existing /api/download_progress polling (which already reports
+    // "no longer present" if the torrent later gets cleaned up) cover the rest.
+    const FAST_PATH_MS = 8_000
+    const pending = Symbol('pending')
+    const outcome = await Promise.race([
+      operation.then((): { ok: true } => ({ ok: true }), (error: unknown): { ok: false; error: unknown } => ({ ok: false, error })),
+      new Promise<typeof pending>((resolve) => setTimeout(() => resolve(pending), FAST_PATH_MS)),
+    ])
+    if (outcome === pending) {
+      log('INFO', `Download still in progress after ${FAST_PATH_MS / 1000}s (likely waiting on torrent metadata): ${details}${via} - continuing in the background`)
+      operation.then(() => logOutcome(null), logOutcome)
+    } else if (!outcome.ok) {
+      logOutcome(outcome.error)
+      return sendJson(response, 502, { ok: false, error: errorMessage(outcome.error) })
+    } else {
+      logOutcome(null)
+    }
     return sendJson(response, 200, { ok: true })
   }
 

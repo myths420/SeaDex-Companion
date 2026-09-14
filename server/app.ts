@@ -1852,14 +1852,17 @@ let qbCache: { data: JsonObject[] | null; timestamp: number } = { data: null, ti
 let qbQueue: Promise<void> = Promise.resolve()
 
 /**
- * Per-torrent budget for qBittorrent to fetch magnet metadata. 15s was too
- * tight in practice - DHT/PEX peer discovery for a freshly-added magnet
- * routinely takes longer than that even when the swarm is healthy (verified
- * by hand: the same magnet resolves fine in qBittorrent's own UI, just not
- * within 15s), so every file-selecting download was failing and deleting
- * the torrent before metadata had a real chance to arrive.
+ * Per-torrent budget for qBittorrent to fetch magnet metadata. 15s, then 45s,
+ * both proved too tight in practice - DHT/PEX peer discovery for a freshly
+ * added magnet routinely takes longer, and a qBittorrent instance managing a
+ * very large existing library can itself be slow to pick up and act on a new
+ * add. Raised to a full hour so a slow-but-eventually-successful resolution
+ * isn't cut off. This is safe to set this high specifically because nothing
+ * downstream blocks on it for that whole duration any more - see the
+ * lock-scoping comment on qbSelectTorrentFiles and the fast-path response in
+ * the /api/download handler.
  */
-export const QB_METADATA_TIMEOUT_MS = 45_000
+export const QB_METADATA_TIMEOUT_MS = 60 * 60_000
 
 async function withQbLock<T>(operation: () => Promise<T>): Promise<T> {
   const previous = qbQueue
@@ -2008,6 +2011,33 @@ function magnetInfoHash(magnet: string): string | null {
   return hash ? hash.toLowerCase() : null
 }
 
+/**
+ * A handful of well-known, widely-used public trackers. A magnet built from
+ * just a SeaDex info-hash (magnet:?xt=urn:btih:<hash>) has no announce URLs
+ * at all, so qBittorrent can only find peers by crawling DHT/PEX - which can
+ * take a long time even for a healthy, well-seeded torrent (confirmed by
+ * hand: the identical hash resolves peers immediately when pasted into
+ * qBittorrent directly, because a magnet copied from a tracker site embeds
+ * its own &tr= trackers). Public releases are near-universally announced to
+ * most of these already, so adding them gives qBittorrent an immediate
+ * announce target instead of waiting on DHT crawling alone.
+ */
+const PUBLIC_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.tiny-vps.com:6969/announce',
+  'udp://open.demonii.com:1337/announce',
+]
+
+export function buildMagnet(hash: string, displayName?: string): string {
+  const params = [`xt=urn:btih:${hash}`]
+  if (displayName) params.push(`dn=${encodeURIComponent(displayName)}`)
+  for (const tracker of PUBLIC_TRACKERS) params.push(`tr=${encodeURIComponent(tracker)}`)
+  return `magnet:?${params.join('&')}`
+}
+
 function normalizedTorrentPath(value: unknown): string {
   return String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+|\/+$/g, '').toLowerCase()
 }
@@ -2035,13 +2065,23 @@ async function qbTorrentExists(config: Config, hash: string): Promise<boolean> {
   return torrents.some((torrent) => String(torrent.hash || '').toLowerCase() === hash)
 }
 
+/**
+ * Magnet metadata is exchanged only while the torrent is running. Start it,
+ * poll for the file list until the per-torrent metadata budget runs out, then
+ * stop it before changing any priorities so the final download contains only
+ * the requested cour.
+ *
+ * Only the brief start/stop/select calls take the qBittorrent lock - the poll
+ * loop itself deliberately does not hold it. QB_METADATA_TIMEOUT_MS is now an
+ * hour, and holding a global lock for that whole span would freeze every
+ * other qBittorrent operation (the progress polling every download card
+ * uses, pause/resume, bulk actions, another download's own add) behind this
+ * one torrent for up to an hour. The poll's GETs are read-only and safe to
+ * interleave with anything else happening concurrently.
+ */
 async function qbSelectTorrentFiles(config: Config, hash: string, selectedFiles: string[], timeoutMs = QB_METADATA_TIMEOUT_MS): Promise<void> {
   const stateBody = new URLSearchParams({ hashes: hash })
-  // Magnet metadata is exchanged only while the torrent is running. Start it,
-  // poll for the file list until the per-torrent metadata budget runs out,
-  // then stop it before changing any priorities so the final download
-  // contains only the requested cour.
-  await qbPostWithFallback(config, ['/api/v2/torrents/start', '/api/v2/torrents/resume'], stateBody)
+  await withQbLock(() => qbPostWithFallback(config, ['/api/v2/torrents/start', '/api/v2/torrents/resume'], stateBody))
   let files: JsonObject[] | null = null
   const metadataDeadline = Date.now() + timeoutMs
   try {
@@ -2069,7 +2109,7 @@ async function qbSelectTorrentFiles(config: Config, hash: string, selectedFiles:
       pollDelay = Math.min(pollDelay * 2, 2000)
     }
   } catch (error) {
-    try { await qbPostWithFallback(config, ['/api/v2/torrents/stop', '/api/v2/torrents/pause'], stateBody) } catch { /* preserve the metadata error */ }
+    try { await withQbLock(() => qbPostWithFallback(config, ['/api/v2/torrents/stop', '/api/v2/torrents/pause'], stateBody)) } catch { /* preserve the metadata error */ }
     throw error
   }
   if (!files) {
@@ -2077,14 +2117,13 @@ async function qbSelectTorrentFiles(config: Config, hash: string, selectedFiles:
     // qBittorrent (preserving files, though normally none exist yet) and
     // report that metadata fetching failed.
     try {
-      await qbPostWithFallback(config, ['/api/v2/torrents/delete'], new URLSearchParams({ hashes: hash, deleteFiles: 'false' }))
+      await withQbLock(() => qbPostWithFallback(config, ['/api/v2/torrents/delete'], new URLSearchParams({ hashes: hash, deleteFiles: 'false' })))
     } catch (removeError) {
       log('WARNING', `Could not remove torrent ${hash} from qBittorrent after the metadata timeout: ${errorMessage(removeError)}`)
     }
     qbCache = { data: null, timestamp: 0 }
     throw new Error(`Metadata fetching failed: qBittorrent did not load the torrent metadata within ${Math.ceil(timeoutMs / 1000)} seconds`)
   }
-  await qbPostWithFallback(config, ['/api/v2/torrents/stop', '/api/v2/torrents/pause'], stateBody)
 
   const wanted = new Set(selectedFiles.map(normalizedTorrentPath).filter(Boolean))
   const indexedFiles = files.map((file, index) => ({ file, index }))
@@ -2095,13 +2134,19 @@ async function qbSelectTorrentFiles(config: Config, hash: string, selectedFiles:
       return [...wanted].some((wantedPath) => path.endsWith(`/${wantedPath}`) || wantedPath.endsWith(`/${path}`))
     })
   }
-  if (!selected.length) throw new Error('The selected cour files could not be matched in qBittorrent; the torrent was left stopped')
+  if (!selected.length) {
+    await withQbLock(() => qbPostWithFallback(config, ['/api/v2/torrents/stop', '/api/v2/torrents/pause'], stateBody))
+    throw new Error('The selected cour files could not be matched in qBittorrent; the torrent was left stopped')
+  }
 
   const allIds = files.map((file, index) => String(file.index ?? index)).join('|')
   const selectedIds = selected.map(({ file, index }) => String(file.index ?? index)).join('|')
-  await qbPostWithFallback(config, ['/api/v2/torrents/filePrio'], new URLSearchParams({ hash, id: allIds, priority: '0' }))
-  await qbPostWithFallback(config, ['/api/v2/torrents/filePrio'], new URLSearchParams({ hash, id: selectedIds, priority: '1' }))
-  await qbPostWithFallback(config, ['/api/v2/torrents/start', '/api/v2/torrents/resume'], stateBody)
+  await withQbLock(async () => {
+    await qbPostWithFallback(config, ['/api/v2/torrents/stop', '/api/v2/torrents/pause'], stateBody)
+    await qbPostWithFallback(config, ['/api/v2/torrents/filePrio'], new URLSearchParams({ hash, id: allIds, priority: '0' }))
+    await qbPostWithFallback(config, ['/api/v2/torrents/filePrio'], new URLSearchParams({ hash, id: selectedIds, priority: '1' }))
+    await qbPostWithFallback(config, ['/api/v2/torrents/start', '/api/v2/torrents/resume'], stateBody)
+  })
 }
 
 export interface QbOwnershipHooks {
@@ -2110,42 +2155,41 @@ export interface QbOwnershipHooks {
 }
 
 export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<void> {
-  return withQbLock(async () => {
-    // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
-    // release, which magnetInfoHash() can't parse a hash out of - the caller
-    // passes the hash it already has (from Prowlarr's search result) instead.
-    const hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
-    if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
+  // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
+  // release, which magnetInfoHash() can't parse a hash out of - the caller
+  // passes the hash it already has (from Prowlarr's search result) instead.
+  const hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
+  if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
+  // Only the duplicate-check-then-add is under the lock (brief - this is what
+  // actually needs to be atomic, to stop two concurrent adds of the same hash
+  // both passing the check). The metadata wait that can follow does not hold
+  // it - see qbSelectTorrentFiles.
+  await withQbLock(async () => {
     if (hash && await qbTorrentExists(config, hash)) throw new Error('Torrent already exists in qBittorrent and was not marked as app-owned')
-    const body = new URLSearchParams({ urls: magnet }); if (category) body.set('category', category)
+    const body = new URLSearchParams({ urls: magnet, tags: 'seadex' }); if (category) body.set('category', category)
     if (selectedFiles.length) { body.set('paused', 'true'); body.set('stopped', 'true') }
     const response = await qbRequest(config, '/api/v2/torrents/add', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })
     const text = await response.text()
-    if (response.status === 200) {
-      let accepted = text.includes('Ok')
-      if (!accepted) {
-        try { const data = JSON.parse(text); accepted = data.success_count > 0 || Boolean(data.added_torrent_ids?.length) } catch { /* handled below */ }
-      }
-      if (accepted) {
-        try {
-          if (hash) ownership?.record(hash)
-          if (selectedFiles.length) await qbSelectTorrentFiles(config, hash!, selectedFiles, timeoutMs)
-        } catch (error) {
-          if (!hash) throw error
-          try {
-            await qbPostWithFallback(config, ['/api/v2/torrents/delete'], new URLSearchParams({ hashes: hash, deleteFiles: 'false' }))
-            ownership?.forget(hash)
-          } catch (cleanupError) {
-            throw new Error(`${errorMessage(error)}; cleanup failed and the torrent may remain in qBittorrent: ${errorMessage(cleanupError)}`)
-          }
-          throw error
-        }
-        qbCache = { data: null, timestamp: 0 }
-        return
-      }
+    let accepted = response.status === 200 && text.includes('Ok')
+    if (!accepted && response.status === 200) {
+      try { const data = JSON.parse(text); accepted = data.success_count > 0 || Boolean(data.added_torrent_ids?.length) } catch { /* handled below */ }
     }
-    throw new Error(`qBittorrent rejected the torrent (HTTP ${response.status}: ${text.slice(0, 120)})`)
+    if (!accepted) throw new Error(`qBittorrent rejected the torrent (HTTP ${response.status}: ${text.slice(0, 120)})`)
   })
+  try {
+    if (hash) ownership?.record(hash)
+    if (selectedFiles.length) await qbSelectTorrentFiles(config, hash!, selectedFiles, timeoutMs)
+  } catch (error) {
+    if (!hash) throw error
+    try {
+      await withQbLock(() => qbPostWithFallback(config, ['/api/v2/torrents/delete'], new URLSearchParams({ hashes: hash, deleteFiles: 'false' })))
+      ownership?.forget(hash)
+    } catch (cleanupError) {
+      throw new Error(`${errorMessage(error)}; cleanup failed and the torrent may remain in qBittorrent: ${errorMessage(cleanupError)}`)
+    }
+    throw error
+  }
+  qbCache = { data: null, timestamp: 0 }
 }
 
 export interface QbBulkAddEntry {
