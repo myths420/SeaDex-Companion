@@ -620,7 +620,15 @@ export function mergeComplementaryCandidates(candidates: ReleaseCandidate[]): Re
     const key = `${candidate.releaseGroup.trim().toLowerCase()}\0${String(candidate.tracker || '').trim().toLowerCase()}`
     const episodes = candidateEpisodes(candidate)
     const groupSets = sets.get(key) || []
-    let target = groupSets.find((set) => !episodes.some((episode) => set.coverage.has(episode)))
+    // A candidate with no parseable per-episode filenames (a full-season BD
+    // remux named by volume/disc, say) can't prove it doesn't overlap an
+    // existing set - `!episodes.some(...)` on an empty array is vacuously
+    // true, which used to let it merge into ANY set regardless of what that
+    // set actually covers, silently combining two unrelated releases (e.g. a
+    // "Best" and an "Alt" from the same group) into one. Treat "unknown
+    // coverage" as "assume it overlaps" instead, so it always starts its own
+    // set and stays a separate, selectable release.
+    let target = episodes.length ? groupSets.find((set) => !episodes.some((episode) => set.coverage.has(episode))) : undefined
     if (!target) { target = { members: [], coverage: new Set<number>() }; groupSets.push(target); sets.set(key, groupSets) }
     target.members.push(candidate)
     for (const episode of episodes) target.coverage.add(episode)

@@ -7,7 +7,7 @@ import { beforeEach, describe, test } from 'node:test'
 import {
   anilistChain, applyUserRulesToResults, arrApiUrl, arrBaseUrl, arrItemUrl, autoNotifyNew, autocheckState, buildScanHistoryEntry, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, commonBestRelease, decryptSecretValues, describeResultChange, discordMessageBody, DEFAULT_CONFIG, effectiveSeasonParts,
   encryptSecretValues, findProwlarrRelease, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
-  qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, releaseDict, scopeReleaseToPart, seadexBest,
+  mergeComplementaryCandidates, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, releaseDict, scopeReleaseToPart, seadexBest,
   resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, syncSonarrSeasonMonitoring, testIntegration,
 } from '../server/app.js'
 import { nextScheduledTime, parseReleaseIndex, processAutocheck, processWebhookScans, queueWebhookScan, refreshAutocheckSchedule, resetWebhookScanState, webhookScanState } from '../server/index.js'
@@ -1344,6 +1344,43 @@ describe('Sonarr season monitoring sync', () => {
       await syncSonarrSeasonMonitoring({ ...sonarrConfig, sonarr_unmonitor_best: false }, [bestResult])
       assert.equal(requests.length, 0)
     } finally { restore() }
+  })
+})
+
+describe('mergeComplementaryCandidates', () => {
+  function candidate(overrides: Partial<ReleaseCandidate>): ReleaseCandidate {
+    return {
+      releaseGroup: 'Headpatter', tracker: 'Private Tracker', quality: '1080p BD-Remux', tags: [],
+      size: 0, file_count: 1, info_hashes: [], is_best: false, source_files: [{ name: 'Headpatter.mkv', length: 0 }],
+      ...overrides,
+    }
+  }
+
+  test('keeps a Best and an Alt release separate when neither has parseable per-episode filenames', () => {
+    // A full-season BD remux named by volume/disc (no "S01E01"-style names) makes
+    // candidateEpisodes() return []. Two unrelated releases from the same group
+    // used to get merged into one because an empty episode list vacuously
+    // "doesn't overlap" any existing set - see the fix comment in the function.
+    const best = candidate({ size: 72_390_000_000, info_hashes: ['a'.repeat(40)], is_best: true })
+    const alt = candidate({ size: 31_700_000_000, info_hashes: ['b'.repeat(40)] })
+    const merged = mergeComplementaryCandidates([best, alt])
+    assert.equal(merged.length, 2, 'the Best and Alt releases must stay distinct, selectable options')
+    assert.deepEqual(new Set(merged.map((c) => c.info_hashes[0])), new Set([best.info_hashes[0], alt.info_hashes[0]]))
+  })
+
+  test('still merges genuinely complementary non-overlapping episode ranges', () => {
+    const partOne = candidate({
+      size: 10, info_hashes: ['a'.repeat(40)],
+      source_files: [{ name: 'Show S01E01.mkv', length: 0 }, { name: 'Show S01E02.mkv', length: 0 }],
+    })
+    const partTwo = candidate({
+      size: 20, info_hashes: ['b'.repeat(40)],
+      source_files: [{ name: 'Show S01E03.mkv', length: 0 }, { name: 'Show S01E04.mkv', length: 0 }],
+    })
+    const merged = mergeComplementaryCandidates([partOne, partTwo])
+    assert.equal(merged.length, 1, 'non-overlapping parts of the same upload should still combine into one queueable release')
+    assert.deepEqual(merged[0].info_hashes.sort(), [partOne.info_hashes[0], partTwo.info_hashes[0]].sort())
+    assert.equal(merged[0].size, 30)
   })
 })
 
