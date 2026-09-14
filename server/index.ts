@@ -257,10 +257,12 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       return sendJson(response, 200, { lines, total: lines.length }, { 'Cache-Control': 'no-store' })
     }
     const state = getState()
+    const scanProgress = state.running ? null : loadScanProgress()
     return sendJson(response, 200, {
       running: state.running, progress: state.progress, total: state.total, message: state.message,
       error: state.error, cancelled: state.cancelled, trigger: state.trigger, source_errors: state.source_errors,
       last_run: state.last_run,
+      resumable_scan: scanProgress ? { processed: scanProgress.processedLibraryKeys.length, total: scanProgress.totalItems, started_at: scanProgress.startedAt } : null,
     }, { 'Cache-Control': 'no-store' })
   }
 
