@@ -130,6 +130,16 @@ export interface Config {
   notify_enabled: boolean
   scan_schedule: ScanSchedule
   hidden: string[]
+  prowlarr_url: string
+  prowlarr_key: string
+  prowlarr_key_configured: boolean
+  prowlarr_indexer_ids: number[]
+}
+
+export interface ProwlarrIndexer {
+  id: number
+  name: string
+  enable: boolean
 }
 
 export interface Status {

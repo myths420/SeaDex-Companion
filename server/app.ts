@@ -2,7 +2,7 @@ import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, 
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { ChainEntry, ChainPart, Config, JsonObject, ReleaseCandidate, ScanScope, ScanState, ScanTrigger } from './types.js'
+import type { ChainEntry, ChainPart, Config, JsonObject, ProwlarrIndexer, ProwlarrRelease, ReleaseCandidate, ScanScope, ScanState, ScanTrigger } from './types.js'
 
 export const SEADEX = 'https://releases.moe/api'
 export const ANILIST = 'https://graphql.anilist.co'
@@ -37,6 +37,9 @@ export const DEFAULT_CONFIG: Config = {
   qbittorrent_pass: '',
   webhook: '',
   notify_enabled: true,
+  prowlarr_url: '',
+  prowlarr_key: '',
+  prowlarr_indexer_ids: [],
   scan_schedule: {
     enabled: true,
     mode: 'interval',
@@ -49,7 +52,7 @@ export const DEFAULT_CONFIG: Config = {
   hidden: [],
 }
 
-export const SECRET_CONFIG_KEYS = ['sonarr_key', 'radarr_key', 'qbittorrent_pass', 'webhook'] as const
+export const SECRET_CONFIG_KEYS = ['sonarr_key', 'radarr_key', 'qbittorrent_pass', 'webhook', 'prowlarr_key'] as const
 export type SecretConfigKey = typeof SECRET_CONFIG_KEYS[number]
 
 export function arrBaseUrl(value: unknown): string {
@@ -59,6 +62,10 @@ export function arrBaseUrl(value: unknown): string {
 export function arrApiUrl(value: unknown): string {
   const base = arrBaseUrl(value)
   return base ? `${base}/api/v3` : ''
+}
+
+export function prowlarrBaseUrl(config: Config): string {
+  return String(config.prowlarr_url || '').trim().replace(/\/+$/, '')
 }
 
 interface EncryptedSecretsPayload {
@@ -1795,6 +1802,13 @@ export async function testIntegration(config: Config, service: string): Promise<
     await qbLogin(base, config.qbittorrent_user, config.qbittorrent_pass)
     return 'Connected to qBittorrent'
   }
+  if (service === 'prowlarr') {
+    const base = prowlarrBaseUrl(config)
+    if (!base || !config.prowlarr_key) throw new Error('Prowlarr URL and API key are required')
+    const status = await api(`${base}/api/v1/system/status`, config.prowlarr_key)
+    const indexers = await api(`${base}/api/v1/indexer`, config.prowlarr_key) as JsonObject[]
+    return `Connected to Prowlarr${status.version ? ` ${status.version}` : ''} (${indexers.length} indexer${indexers.length === 1 ? '' : 's'})`
+  }
   if (service === 'discord') {
     if (!config.webhook) throw new Error('Discord webhook URL is required')
     const response = await fetchWithTimeout(config.webhook, {
@@ -1813,6 +1827,61 @@ export async function testIntegration(config: Config, service: string): Promise<
     return 'Test message sent to Discord'
   }
   throw new Error('Unknown integration')
+}
+
+export async function listProwlarrIndexers(config: Config): Promise<ProwlarrIndexer[]> {
+  const base = prowlarrBaseUrl(config)
+  if (!base || !config.prowlarr_key) throw new Error('Prowlarr is not configured (Config tab)')
+  const indexers = await api(`${base}/api/v1/indexer`, config.prowlarr_key) as JsonObject[]
+  return indexers.map((indexer) => ({ id: Number(indexer.id), name: String(indexer.name || `Indexer ${indexer.id}`), enable: Boolean(indexer.enable) }))
+}
+
+/** Raw torrent search against Prowlarr, restricted to the configured indexers when any are selected. */
+async function prowlarrSearch(config: Config, query: string): Promise<ProwlarrRelease[]> {
+  const base = prowlarrBaseUrl(config)
+  if (!base || !config.prowlarr_key) return []
+  const params = new URLSearchParams({ query, type: 'search' })
+  for (const id of config.prowlarr_indexer_ids || []) params.append('indexerIds', String(id))
+  const results = (await api(`${base}/api/v1/search?${params}`, config.prowlarr_key)) as JsonObject[]
+  return results.filter((result) => result.protocol === 'torrent') as ProwlarrRelease[]
+}
+
+/**
+ * SeaDex never publishes an infoHash for a release it lists on a private
+ * tracker (see isDownloadable), so those can never be sent to qBittorrent from
+ * SeaDex's own data. When Prowlarr is configured, look for the same release
+ * group's upload of the same title/season among the trackers Prowlarr can
+ * search, so the download can go through a real tracker link (announce +
+ * passkey baked in) instead of the DHT-only magnet SeaDex would offer for a
+ * public release.
+ */
+export async function findProwlarrRelease(config: Config, item: JsonObject, release: JsonObject, season: number): Promise<ProwlarrRelease | null> {
+  if (!prowlarrBaseUrl(config) || !config.prowlarr_key) return null
+  const title = String(item.title || '').trim()
+  if (!title) return null
+  let results: ProwlarrRelease[]
+  try {
+    results = await prowlarrSearch(config, title)
+  } catch (error) {
+    log('WARNING', `Prowlarr search failed for "${title}": ${errorMessage(error)}`)
+    return null
+  }
+  const group = String(release.releaseGroup || '').trim().toLowerCase()
+  // A plain substring match would let "Group" match a title tagged "OtherGroup" -
+  // require it to appear as its own tag/word (bounded by anything that isn't a
+  // letter or digit) instead of anywhere inside a longer name.
+  const groupPattern = group ? new RegExp(`(^|[^a-z0-9])${group.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i') : null
+  const seasonTag = season > 0 ? `s${String(season).padStart(2, '0')}` : null
+  const matches = results.filter((result) => {
+    if (!result.downloadUrl && !result.magnetUrl) return false
+    const name = String(result.title || '').toLowerCase()
+    if (groupPattern && !groupPattern.test(name)) return false
+    if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return false
+    return true
+  })
+  if (!matches.length) return null
+  matches.sort((left, right) => Number(right.seeders || 0) - Number(left.seeders || 0))
+  return matches[0]
 }
 
 function isTimeoutLikeError(error: unknown): boolean {
@@ -1938,9 +2007,12 @@ export interface QbOwnershipHooks {
   forget: (hash: string) => void
 }
 
-export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks): Promise<void> {
+export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<void> {
   return withQbLock(async () => {
-    const hash = magnetInfoHash(magnet)
+    // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
+    // release, which magnetInfoHash() can't parse a hash out of - the caller
+    // passes the hash it already has (from Prowlarr's search result) instead.
+    const hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
     if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
     if (hash && await qbTorrentExists(config, hash)) throw new Error('Torrent already exists in qBittorrent and was not marked as app-owned')
     const body = new URLSearchParams({ urls: magnet }); if (category) body.set('category', category)

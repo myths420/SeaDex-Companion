@@ -4,7 +4,7 @@ import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetOwnedTorrents,
-  finishBulkDownloadBatch, getState, indexResultReleases, loadConfig, loadLastResults, loadScanHistory, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
+  finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
   resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
 } from './app.js'
@@ -352,6 +352,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       radarr: ['radarr_url', 'radarr_key'],
       qbittorrent: ['qbittorrent_url', 'qbittorrent_user', 'qbittorrent_pass'],
       discord: ['webhook'],
+      prowlarr: ['prowlarr_url', 'prowlarr_key'],
     }
     const fields = serviceFields[service]
     if (!fields) return sendJson(response, 400, { error: 'Unknown integration' })
@@ -370,6 +371,23 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       log('ERROR', `Integration test failed: ${service} after ${((Date.now() - started) / 1000).toFixed(1)}s (${message})`)
+      return sendJson(response, 502, { ok: false, error: message })
+    }
+  }
+
+  if (method === 'POST' && path === '/api/prowlarr/indexers') {
+    // Mirrors /api/config/test: reads live, not-yet-saved form values so the
+    // indexer picker works right after Test connection, not only after Save.
+    const data = await readJson(request)
+    const submitted = data.config && typeof data.config === 'object' ? data.config as JsonObject : {}
+    const config = loadConfig()
+    if ('prowlarr_url' in submitted) config.prowlarr_url = submitted.prowlarr_url == null ? '' : String(submitted.prowlarr_url).trim()
+    if ('prowlarr_key' in submitted) { const value = submitted.prowlarr_key == null ? '' : String(submitted.prowlarr_key).trim(); if (value) config.prowlarr_key = value }
+    try {
+      const indexers = await listProwlarrIndexers(config)
+      return sendJson(response, 200, { ok: true, indexers })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       return sendJson(response, 502, { ok: false, error: message })
     }
   }
@@ -445,24 +463,42 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     const found = findResult(key, releaseIndex)
     if (found.error) return sendJson(response, found.error[0], { ok: false, error: found.error[1] })
     const hashes = (found.release!.info_hashes || []).map((hash: string) => hash.toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash))
-    if (!hashes.length) return sendJson(response, 400, { ok: false, error: 'No magnet available for this release (private tracker)' })
     const config = loadConfig()
+    let prowlarrMatch: Awaited<ReturnType<typeof findProwlarrRelease>> = null
+    if (!hashes.length) {
+      prowlarrMatch = await findProwlarrRelease(config, found.result!, found.release!, Number(found.result!.season) || 0)
+      if (!prowlarrMatch) {
+        return sendJson(response, 400, {
+          ok: false,
+          error: config.prowlarr_url
+            ? 'No magnet available for this release (private tracker), and no matching release was found on Prowlarr'
+            : 'No magnet available for this release (private tracker). Configure Prowlarr in Settings to search your indexers for it.',
+        })
+      }
+    }
     const category = String(config[`${String(found.result!.arr).toLowerCase()}_category`] || '').trim()
     const selectedFiles = Array.isArray(found.release!.selected_files) ? found.release!.selected_files.map(String) : []
     const started = Date.now()
     const details = releaseDetails(found.result!, found.release!, releaseIndex)
-    log('INFO', `Download requested: ${details} (torrents: ${hashes.length}; category: ${category || '-'}; files: ${selectedFiles.length ? `${selectedFiles.length} selected` : 'all'})`)
+    const via = prowlarrMatch ? ` via Prowlarr indexer "${prowlarrMatch.indexer}"` : ''
+    log('INFO', `Download requested: ${details}${via} (torrents: ${hashes.length || 1}; category: ${category || '-'}; files: ${selectedFiles.length ? `${selectedFiles.length} selected` : 'all'})`)
+    const ownership = {
+      record: (ownedHash: string) => recordOwnedTorrents([ownedHash]),
+      forget: (ownedHash: string) => forgetOwnedTorrents([ownedHash]),
+    }
     try {
-      for (const hash of hashes) await qbAddTorrent(config, `magnet:?xt=urn:btih:${hash}`, category, selectedFiles, undefined, {
-        record: (ownedHash) => recordOwnedTorrents([ownedHash]),
-        forget: (ownedHash) => forgetOwnedTorrents([ownedHash]),
-      })
+      if (prowlarrMatch) {
+        const link = prowlarrMatch.magnetUrl || prowlarrMatch.downloadUrl!
+        await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+      } else {
+        for (const hash of hashes) await qbAddTorrent(config, `magnet:?xt=urn:btih:${hash}`, category, selectedFiles, undefined, ownership)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      log('ERROR', `Download failed after ${((Date.now() - started) / 1000).toFixed(1)}s: ${details} (${message})`)
+      log('ERROR', `Download failed after ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (${message})`)
       return sendJson(response, 502, { ok: false, error: message })
     }
-    log('INFO', `Download added in ${((Date.now() - started) / 1000).toFixed(1)}s: ${details} (torrents: ${hashes.length}; tracked torrents: ${ownedTorrentsSnapshot().length})`)
+    log('INFO', `Download added in ${((Date.now() - started) / 1000).toFixed(1)}s: ${details}${via} (tracked torrents: ${ownedTorrentsSnapshot().length})`)
     return sendJson(response, 200, { ok: true })
   }
 

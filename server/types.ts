@@ -24,6 +24,28 @@ export interface Config extends JsonObject {
   notify_enabled: boolean
   scan_schedule: ScanSchedule
   hidden: string[]
+  prowlarr_url: string
+  prowlarr_key: string
+  prowlarr_indexer_ids: number[]
+}
+
+export interface ProwlarrIndexer {
+  id: number
+  name: string
+  enable: boolean
+}
+
+export interface ProwlarrRelease extends JsonObject {
+  title: string
+  indexerId: number
+  indexer: string
+  size: number
+  seeders: number
+  leechers: number
+  protocol: 'torrent' | 'usenet'
+  downloadUrl?: string
+  magnetUrl?: string
+  infoHash?: string
 }
 
 export type ScanTrigger = 'manual' | 'scheduled' | 'sonarr' | 'radarr' | 'sonarr+radarr'

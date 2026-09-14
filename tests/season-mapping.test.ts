@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { beforeEach, describe, test } from 'node:test'
 import {
   anilistChain, applyUserRulesToResults, arrApiUrl, arrBaseUrl, arrItemUrl, autoNotifyNew, autocheckState, buildScanHistoryEntry, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, commonBestRelease, decryptSecretValues, describeResultChange, discordMessageBody, DEFAULT_CONFIG, effectiveSeasonParts,
-  encryptSecretValues, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
+  encryptSecretValues, findProwlarrRelease, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
   qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, releaseDict, scopeReleaseToPart, seadexBest,
   resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, testIntegration,
 } from '../server/app.js'
@@ -1257,6 +1257,48 @@ async function scanWith(best: Map<number, JsonObject>, chain: JsonObject[], item
     autoNotifyNew: async () => 0,
   })
 }
+
+describe('Prowlarr fallback for private-tracker releases', () => {
+  const prowlarrConfig = { ...DEFAULT_CONFIG, prowlarr_url: 'http://prowlarr:9696', prowlarr_key: 'key', prowlarr_indexer_ids: [] as number[] }
+
+  function mockProwlarrSearch(results: JsonObject[]) {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      assert.match(String(input), /^http:\/\/prowlarr:9696\/api\/v1\/search\?/)
+      return new Response(JSON.stringify(results), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+    return () => { globalThis.fetch = originalFetch }
+  }
+
+  test('returns null when Prowlarr is not configured', async () => {
+    const result = await findProwlarrRelease(DEFAULT_CONFIG, { title: 'Some Anime' }, { releaseGroup: 'Group' }, 1)
+    assert.equal(result, null)
+  })
+
+  test('matches by release group and season, preferring more seeders', async () => {
+    const restore = mockProwlarrSearch([
+      { title: 'Some Anime S01 [Other][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerA', seeders: 3, downloadUrl: 'http://prowlarr:9696/dl/a', infoHash: 'a'.repeat(40) },
+      { title: 'Some Anime S01 [Group][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerB', seeders: 1, downloadUrl: 'http://prowlarr:9696/dl/b', infoHash: 'b'.repeat(40) },
+      { title: 'Some Anime S01 [Group][720p]', protocol: 'torrent', indexer: 'PrivateTrackerC', seeders: 9, downloadUrl: 'http://prowlarr:9696/dl/c', infoHash: 'c'.repeat(40) },
+      { title: 'Some Anime S01 [Group][1080p]', protocol: 'usenet', indexer: 'UsenetIndexer', seeders: 999, downloadUrl: 'http://prowlarr:9696/dl/d' },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group' }, 1)
+      assert.ok(result)
+      assert.equal(result!.indexer, 'PrivateTrackerC')
+    } finally { restore() }
+  })
+
+  test('returns null when nothing matches the release group', async () => {
+    const restore = mockProwlarrSearch([
+      { title: 'Some Anime S01 [OtherGroup][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerA', seeders: 5, downloadUrl: 'http://prowlarr:9696/dl/a' },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group' }, 1)
+      assert.equal(result, null)
+    } finally { restore() }
+  })
+})
 
 describe('update checking', () => {
   test('reports a newer GitHub release and caches the result', async () => {

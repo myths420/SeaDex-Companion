@@ -1,4 +1,4 @@
-import { AuthState, Config, ResultItem, ScanHistoryEntry, ScannedDataInfo, Status } from './types'
+import { AuthState, Config, ProwlarrIndexer, ResultItem, ScanHistoryEntry, ScannedDataInfo, Status } from './types'
 
 export const AUTH_REQUIRED_EVENT = 'seadex:authentication-required'
 
@@ -59,11 +59,18 @@ export const saveConfig = (cfg: Partial<Config>) =>
   })
 
 
-export const testConnection = (service: 'sonarr' | 'radarr' | 'qbittorrent' | 'discord', config: Record<string, any>) =>
+export const testConnection = (service: 'sonarr' | 'radarr' | 'qbittorrent' | 'discord' | 'prowlarr', config: Record<string, any>) =>
   api<{ ok: boolean; message: string }>('/api/config/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ service, config }),
+  })
+
+export const getProwlarrIndexers = (config: Record<string, any>) =>
+  api<{ ok: boolean; indexers: ProwlarrIndexer[] }>('/api/prowlarr/indexers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config }),
   })
 
 export const getStatus = () => api<Status>('/api/status')

@@ -702,7 +702,12 @@ function Season({ r, config, tone, dl, busyDownload, onDownload, onPause, onResu
                   total_size: dlState.total_size,
                   speed: dlState.speed,
                 } : null
-                const disabled = owned || complete || !rel.downloadable || inClient
+                // A release with no SeaDex magnet (private tracker) is still worth a
+                // click when Prowlarr is configured - the server searches Prowlarr's
+                // indexers for a matching upload before giving up. Only truly block
+                // the button when there's no way for the server to resolve a link.
+                const prowlarrConfigured = Boolean(config?.prowlarr_url)
+                const disabled = owned || complete || (!rel.downloadable && !prowlarrConfigured) || inClient
                 const btnTitle = owned
                   ? 'You already have this release'
                   : complete
@@ -711,7 +716,9 @@ function Season({ r, config, tone, dl, busyDownload, onDownload, onPause, onResu
                   ? dlState.phase === 'paused' ? 'Paused in qBittorrent' : 'Downloading…'
                   : rel.downloadable
                   ? 'Send this release to qBittorrent (category: ' + (cat || r.arr) + ')'
-                  : 'No magnet available (private tracker)'
+                  : prowlarrConfigured
+                  ? 'No SeaDex magnet (private tracker) - will search Prowlarr for a match'
+                  : 'No magnet available (private tracker). Configure Prowlarr in Settings to search your indexers for it.'
                 const pct = Math.min(100, Math.round(dlState.progress * 1000) / 10)
                 // releases.moe marks dual-audio releases with a separate flag
                 // (not part of the quality "tags" list), so surface it here too.
