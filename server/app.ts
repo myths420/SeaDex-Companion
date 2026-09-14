@@ -1974,7 +1974,14 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
     if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return false
     return true
   })
-  if (!matches.length) return null
+  if (!matches.length) {
+    // Falling back to a SeaDex hash after this is silent otherwise, making a
+    // dead-magnet timeout look like Prowlarr never ran at all. Log what
+    // Prowlarr actually returned so a "no matching release" fallback is
+    // distinguishable from "the search itself came back empty."
+    log('INFO', `Prowlarr: no match for "${title}"${group ? ` [${release.releaseGroup}]` : ''}${seasonTag ? ` (${seasonTag})` : ''} among ${results.length} search result${results.length === 1 ? '' : 's'} across your configured indexers - falling back to SeaDex`)
+    return null
+  }
   matches.sort((left, right) => Number(right.seeders || 0) - Number(left.seeders || 0))
   return matches[0]
 }
