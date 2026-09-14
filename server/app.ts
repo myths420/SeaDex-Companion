@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,7 @@ export const ENCRYPTED_SECRETS_FILE = join(DATA_DIR, 'secrets.enc.json')
 export const SECRETS_KEY_FILE = process.env.SECRETS_KEY_FILE || join(DATA_DIR, '.seadex-key')
 export const CACHE_FILE = join(DATA_DIR, 'anilist_cache.json')
 export const RESULTS_FILE = join(DATA_DIR, 'last_results.json')
+export const SCAN_PROGRESS_FILE = join(DATA_DIR, 'scan_progress.json')
 export const NOTIFIED_FILE = join(DATA_DIR, 'notified.json')
 export const OWNED_TORRENTS_FILE = join(DATA_DIR, 'owned_torrents.json')
 export const USER_RULES_FILE = join(DATA_DIR, 'user_rules.json')
@@ -341,6 +342,30 @@ export function saveLastResults(results: JsonObject[], lastRun: string | null): 
   writeJsonAtomic(RESULTS_FILE, { results, last_run: lastRun })
 }
 export function loadLastResults(): JsonObject | null { return readJson<JsonObject | null>(RESULTS_FILE, null) }
+
+export interface ScanProgress {
+  trigger: ScanTrigger
+  processedLibraryKeys: string[]
+  totalItems: number
+  startedAt: string
+}
+
+/**
+ * Tracks which items an in-progress scan has already finished, separately
+ * from the results checkpoint - lets an interrupted scan (container restart
+ * mid-scan) be resumed via the "Continue scan" button without re-walking
+ * items already done, instead of every scan always starting over from item
+ * one. Cleared (null) once a scan actually finishes, is cancelled, or fails -
+ * only a run cut short by the process dying outright should ever be resumable.
+ */
+export function saveScanProgress(progress: ScanProgress | null): void {
+  if (progress === null) {
+    try { unlinkSync(SCAN_PROGRESS_FILE) } catch { /* already gone */ }
+    return
+  }
+  writeJsonAtomic(SCAN_PROGRESS_FILE, progress)
+}
+export function loadScanProgress(): ScanProgress | null { return readJson<ScanProgress | null>(SCAN_PROGRESS_FILE, null) }
 
 export interface UserRules {
   mappings: Record<string, number>
@@ -1407,6 +1432,8 @@ export interface ScanDependencies {
   recordScanHistory?: (previous: JsonObject[], current: JsonObject[], runAt: string, file?: string, trigger?: ScanTrigger, metadata?: { durationSeconds?: number; scannedTitles?: number; sourceErrors?: Record<string, string>; outcome?: ScanHistoryEntry['outcome']; error?: string }) => ScanHistoryEntry
   syncSonarrSeasonMonitoring?: typeof syncSonarrSeasonMonitoring
   checkpointIntervalMs?: number
+  saveScanProgress?: typeof saveScanProgress
+  loadScanProgress?: typeof loadScanProgress
 }
 
 /** How often an in-progress scan's results are written to disk (see the checkpoint comment in runScan). */
@@ -1460,7 +1487,7 @@ export async function syncSonarrSeasonMonitoring(config: Config, results: JsonOb
   }
 }
 
-export async function runScan(config: Config | JsonObject, dependencies: ScanDependencies = {}, trigger: ScanTrigger = 'manual', scope: ScanScope = {}): Promise<void> {
+export async function runScan(config: Config | JsonObject, dependencies: ScanDependencies = {}, trigger: ScanTrigger = 'manual', scope: ScanScope = {}, resume = false): Promise<void> {
   const started = Date.now()
   const previousState = getState()
   const controller = new AbortController()
@@ -1508,12 +1535,25 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
     // only a scan that actually finishes counts as "completed".
     const checkpointIntervalMs = dependencies.checkpointIntervalMs ?? CHECKPOINT_INTERVAL_MS
     let lastCheckpointAt = Date.now()
+    // A checkpointed result is not enough on its own to skip re-processing an
+    // item on the *next* scan attempt - that would also skip a legitimate
+    // rescan's upgrade checks. processedLibraryKeys is the separate, explicit
+    // "Continue scan" record: only consulted when the caller passed
+    // resume=true (the user clicked Continue scan, not Scan library).
+    const priorProgress = resume ? (dependencies.loadScanProgress || loadScanProgress)() : null
+    const alreadyProcessed = new Set(priorProgress?.processedLibraryKeys || [])
+    const processedLibraryKeys: string[] = [...alreadyProcessed]
+    const progressStartedAt = priorProgress?.startedAt || new Date(started).toISOString()
+    if (resume && alreadyProcessed.size) log('INFO', `Continuing scan: ${alreadyProcessed.size} of ${items.length} item${items.length === 1 ? '' : 's'} already done`)
     const checkpoint = (allResults: JsonObject[]) => {
       const now = Date.now()
       if (now - lastCheckpointAt < checkpointIntervalMs) return
       lastCheckpointAt = now
-      try { (dependencies.saveLastResults || saveLastResults)(allResults, previousState.last_run); checkpointed = true }
-      catch (error) { log('WARNING', `Could not checkpoint in-progress scan results: ${errorMessage(error)}`) }
+      try {
+        (dependencies.saveLastResults || saveLastResults)(allResults, previousState.last_run)
+        ;(dependencies.saveScanProgress || saveScanProgress)({ trigger, processedLibraryKeys: [...processedLibraryKeys], totalItems: items.length, startedAt: progressStartedAt })
+        checkpointed = true
+      } catch (error) { log('WARNING', `Could not checkpoint in-progress scan results: ${errorMessage(error)}`) }
     }
     stage = 'resolving library titles'
     for (const [itemIndex, item] of items.entries()) {
@@ -1521,6 +1561,12 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
       setState({ progress: itemIndex, message: `Resolving: ${item.title}` })
       const arrUrl = arrItemUrl(config, item)
       const libraryKey = libraryItemKey(item)
+      if (alreadyProcessed.has(libraryKey)) {
+        const carried = previousResults.filter((result) => String(result.library_key || '') === libraryKey)
+        results.push(...carried)
+        setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+        continue
+      }
       const mappingId = rules.mappings[libraryKey]
       let chain: ChainEntry[]
       try {
@@ -1534,6 +1580,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
         const carried = previousResults.filter((result) => String(result.library_key || '') === libraryKey)
         results.push(...carried)
         setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+        processedLibraryKeys.push(libraryKey)
         checkpoint([...retainedResults, ...results])
         continue
       }
@@ -1548,6 +1595,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
           banner: null, anilist_id: null, arr_url: arrUrl,
         })
         setState({ progress: itemIndex + 1, results: [...results] })
+        processedLibraryKeys.push(libraryKey)
         checkpoint([...retainedResults, ...results])
         continue
       }
@@ -1643,6 +1691,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
         }
       }
       setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+      processedLibraryKeys.push(libraryKey)
       checkpoint([...retainedResults, ...results])
     }
     if (controller.signal.aborted) throw new DOMException('Scan cancelled', 'AbortError')
@@ -1651,6 +1700,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
     setState({ progress: items.length, message: Object.keys(sourceErrors).length ? 'Done with integration errors' : 'Done', results: finalResults, last_run: lastRun, source_errors: sourceErrors })
     stage = 'saving scan results'
     ;(dependencies.saveLastResults || saveLastResults)(finalResults, lastRun)
+    ;(dependencies.saveScanProgress || saveScanProgress)(null)
     try {
       const metadata = { durationSeconds: Math.round((Date.now() - started) / 100) / 10, scannedTitles: items.length, sourceErrors }
       if (dependencies.recordScanHistory) dependencies.recordScanHistory(previousResults, finalResults, lastRun, undefined, trigger, metadata)
@@ -1690,9 +1740,13 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
     if (checkpointed) {
       // A checkpoint from this now-aborted run landed on disk earlier - put
       // the last genuinely completed scan's data back so a restart doesn't
-      // pick up half-finished results as if they were real.
-      try { (dependencies.saveLastResults || saveLastResults)(previousState.results, previousState.last_run) }
-      catch (error) { log('WARNING', `Could not restore checkpointed results after the scan ${outcome}: ${errorMessage(error)}`) }
+      // pick up half-finished results as if they were real. The resume
+      // record goes with it: a scan the user cancelled, or one that hit a
+      // real error, isn't what "Continue scan" should offer to pick back up.
+      try {
+        (dependencies.saveLastResults || saveLastResults)(previousState.results, previousState.last_run)
+        ;(dependencies.saveScanProgress || saveScanProgress)(null)
+      } catch (error) { log('WARNING', `Could not restore checkpointed results after the scan ${outcome}: ${errorMessage(error)}`) }
     }
     if (!dependencies.saveLastResults) {
       try { recordScanHistory(previousState.results, previousState.results, timestamp(), HISTORY_FILE, trigger, { durationSeconds: Math.round((Date.now() - started) / 100) / 10, scannedTitles: 0, outcome, error: cancelled ? 'Cancelled by user' : message }) }

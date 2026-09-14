@@ -23,6 +23,7 @@ const INITIAL_STATUS: Status = {
   last_run: null,
   next_check: null,
   webhook_scan: { queued: false, due_at: null, sources: [] },
+  resumable_scan: null,
 }
 
 interface AuthenticatedAppProps {
@@ -131,10 +132,10 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
     }
   }, [loadConfig, loadResults, pollStatus])
 
-  const handleScan = async () => {
+  const handleScan = async (resume = false) => {
     try {
       setScanCompleted(null)
-      const r = await api.startScan()
+      const r = await api.startScan(resume)
       if (!r.ok) throw new Error(r.error || 'Could not start scan')
       scanWasRunning.current = true
       setStatus({ ...INITIAL_STATUS, running: true, message: 'Starting scan…' })
@@ -194,7 +195,8 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
             config={config}
             status={status}
             lastRun={lastRun}
-            onScan={handleScan}
+            onScan={() => void handleScan()}
+            onContinueScan={() => void handleScan(true)}
             loading={resultsLoading}
             loadError={resultsError}
             onReloadResults={() => void loadResults()}
@@ -205,7 +207,7 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
           />
         )}
         {tab === 'history' && <HistoryTab />}
-        {tab === 'config' && <ConfigTab config={config} status={status} username={username} onRunScan={handleScan} onAccountUpdated={onAccountUpdated} onSaved={loadConfig} onScannedDataCleared={handleScannedDataCleared} />}
+        {tab === 'config' && <ConfigTab config={config} status={status} username={username} onRunScan={() => void handleScan()} onAccountUpdated={onAccountUpdated} onSaved={loadConfig} onScannedDataCleared={handleScannedDataCleared} />}
         {tab === 'log' && <LogTab active={tab === 'log'} />}
         </div>
       </main>

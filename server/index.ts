@@ -5,7 +5,7 @@ import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetOwnedTorrents,
-  finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
+  finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
   resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
 } from './app.js'
@@ -425,11 +425,13 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 
   if (method === 'GET' && path === '/api/status') {
     const state = getState()
+    const scanProgress = state.running ? null : loadScanProgress()
     return sendJson(response, 200, {
       running: state.running, progress: state.progress, total: state.total, message: state.message,
       error: state.error, cancelled: state.cancelled, trigger: state.trigger, source_errors: state.source_errors,
       last_run: state.last_run, next_check: autocheckState.next,
       webhook_scan: { queued: webhookScanState.dueAt !== null, due_at: webhookScanState.dueAt, sources: [...webhookScanState.sources] },
+      resumable_scan: scanProgress ? { processed: scanProgress.processedLibraryKeys.length, total: scanProgress.totalItems, started_at: scanProgress.startedAt } : null,
     })
   }
 
@@ -460,6 +462,11 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       log('WARNING', 'Manual scan request ignored: a scan is already running')
       return sendJson(response, 409, { ok: false, error: 'Scan already running' })
     }
+    const data = await readJson(request)
+    const resume = Boolean(data.resume)
+    if (resume && !loadScanProgress()) {
+      return sendJson(response, 409, { ok: false, error: 'No interrupted scan to continue' })
+    }
     let config: Config
     try { config = loadConfig() } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -468,7 +475,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     }
     resetWebhookScanState(); autocheckState.pending = false
     setState({ running: true })
-    void runScan(config, {}, 'manual')
+    void runScan(config, {}, 'manual', {}, resume)
     return sendJson(response, 200, { ok: true })
   }
 

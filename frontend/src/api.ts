@@ -110,8 +110,12 @@ export const setExclusion = (libraryKey: string, season: number | null, part: st
 export const getLogs = (lines = 500) =>
   api<{ lines: string[]; total: number }>(`/api/logs?lines=${lines}`)
 
-export const startScan = () =>
-  api<{ ok: boolean; error?: string }>('/api/scan', { method: 'POST' })
+export const startScan = (resume = false) =>
+  api<{ ok: boolean; error?: string }>('/api/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ resume }),
+  })
 
 export const cancelScan = () =>
   api<{ ok: boolean; error?: string }>('/api/scan/cancel', { method: 'POST' })

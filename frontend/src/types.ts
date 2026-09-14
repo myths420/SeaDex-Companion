@@ -157,4 +157,5 @@ export interface Status {
   last_run: string | null
   next_check: number | null
   webhook_scan: { queued: boolean; due_at: number | null; sources: Array<'sonarr' | 'radarr'> }
+  resumable_scan: { processed: number; total: number; started_at: string } | null
 }

@@ -1495,6 +1495,65 @@ describe('mid-scan checkpointing', () => {
   })
 })
 
+describe('scan resume ("Continue scan")', () => {
+  test('resume=true skips items already recorded, carrying their previous result forward', async () => {
+    setState({ results: [{ key: 'old', library_key: 'Sonarr:item1', title: 'AlreadyDone', arr: 'Sonarr', status: 'best' }] })
+    const anilistCalls: string[] = []
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: async () => new Map(),
+      localItems: async () => [
+        { arr: 'Sonarr', id: 1, title: 'AlreadyDone', seasons: { 1: { groups: [], size: 0 } } },
+        { arr: 'Sonarr', id: 2, title: 'StillToDo', seasons: { 1: { groups: [], size: 0 } } },
+      ],
+      anilistChain: async (title: string) => { anilistCalls.push(title); return [] },
+      loadCache: () => ({}),
+      saveLastResults: () => undefined,
+      saveScanProgress: () => undefined,
+      loadScanProgress: () => ({ trigger: 'manual', processedLibraryKeys: ['Sonarr:item1'], totalItems: 2, startedAt: new Date().toISOString() }),
+      autoNotifyNew: async () => 0,
+    }, 'manual', {}, true)
+    assert.deepEqual(anilistCalls, ['StillToDo'], 'the already-processed item must not be re-looked-up')
+    const titles = getState().results.map((result) => result.title)
+    assert.ok(titles.includes('AlreadyDone'), 'the carried-forward item must still be present in the results')
+    assert.equal(getState().results.find((result) => result.title === 'AlreadyDone')?.status, 'best', 'its prior result must be untouched')
+  })
+
+  test('a normal (non-resume) scan re-checks every item even if progress from a prior attempt exists', async () => {
+    const anilistCalls: string[] = []
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: async () => new Map(),
+      localItems: async () => [{ arr: 'Sonarr', id: 1, title: 'Title', seasons: { 1: { groups: [], size: 0 } } }],
+      anilistChain: async (title: string) => { anilistCalls.push(title); return [] },
+      loadCache: () => ({}),
+      saveLastResults: () => undefined,
+      saveScanProgress: () => undefined,
+      loadScanProgress: () => ({ trigger: 'manual', processedLibraryKeys: ['Sonarr:item1'], totalItems: 1, startedAt: new Date().toISOString() }),
+      autoNotifyNew: async () => 0,
+    }, 'manual', {}, false)
+    assert.deepEqual(anilistCalls, ['Title'], 'without resume=true, loadScanProgress must not even be consulted')
+  })
+
+  test('checkpoints the resume record alongside results, and clears it once the scan completes', async () => {
+    const progressSaves: (JsonObject | null)[] = []
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: async () => new Map(),
+      localItems: async () => [
+        { arr: 'Sonarr', id: 1, title: 'First', seasons: { 1: { groups: [], size: 0 } } },
+        { arr: 'Sonarr', id: 2, title: 'Second', seasons: { 1: { groups: [], size: 0 } } },
+      ],
+      anilistChain: async () => [],
+      loadCache: () => ({}),
+      saveLastResults: () => undefined,
+      saveScanProgress: (progress) => { progressSaves.push(progress) },
+      autoNotifyNew: async () => 0,
+      checkpointIntervalMs: 0,
+    })
+    assert.ok(progressSaves.length >= 2, 'expected at least one mid-scan checkpoint plus the final clear')
+    assert.deepEqual(progressSaves[0]?.processedLibraryKeys, ['Sonarr:item1'], 'the first checkpoint should record only the first item done')
+    assert.equal(progressSaves.at(-1), null, 'the resume record must be cleared once the scan actually finishes')
+  })
+})
+
 describe('update checking', () => {
   test('reports a newer GitHub release and caches the result', async () => {
     const originalFetch = globalThis.fetch
