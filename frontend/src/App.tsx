@@ -132,13 +132,13 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
     }
   }, [loadConfig, loadResults, pollStatus])
 
-  const handleScan = async (resume = false) => {
+  const handleScan = async (resume = false, libraryKey?: string) => {
     try {
       setScanCompleted(null)
-      const r = await api.startScan(resume)
+      const r = await api.startScan(resume, libraryKey)
       if (!r.ok) throw new Error(r.error || 'Could not start scan')
       scanWasRunning.current = true
-      setStatus({ ...INITIAL_STATUS, running: true, message: 'Starting scan…' })
+      setStatus({ ...INITIAL_STATUS, running: true, message: libraryKey ? 'Rescanning…' : 'Starting scan…' })
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
       pollTimer.current = null
       const generation = ++pollGeneration.current
@@ -195,7 +195,7 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
             config={config}
             status={status}
             lastRun={lastRun}
-            onScan={() => void handleScan()}
+            onScan={(libraryKey) => void handleScan(false, libraryKey)}
             onContinueScan={() => void handleScan(true)}
             loading={resultsLoading}
             loadError={resultsError}

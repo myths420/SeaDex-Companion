@@ -7,7 +7,7 @@ import { beforeEach, describe, test } from 'node:test'
 import {
   anilistChain, applyUserRulesToResults, arrApiUrl, arrBaseUrl, arrItemUrl, autoNotifyNew, autocheckState, buildScanHistoryEntry, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, commonBestRelease, decryptSecretValues, describeResultChange, discordMessageBody, DEFAULT_CONFIG, effectiveSeasonParts,
   encryptSecretValues, findProwlarrRelease, getState, loadLocalLibrary, loadStringSet, localItems, localPartOwnership, normalizeQbStates, normalizeScanSchedule, orderedPartReleases, pickAniListSearchResult, pickBest, publicConfig,
-  buildMagnet, mergeComplementaryCandidates, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, releaseDict, scopeReleaseToPart, seadexBest,
+  buildMagnet, fetchTorrentFile, MagnetRedirectError, mergeComplementaryCandidates, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, releaseDict, scopeReleaseToPart, seadexBest,
   resetRuntimeForTests, resetUpdateCheck, runScan, scannedDataInfo, sendToDiscord, setState, syncSonarrSeasonMonitoring, testIntegration,
 } from '../server/app.js'
 import { nextScheduledTime, parseReleaseIndex, processAutocheck, processWebhookScans, queueWebhookScan, refreshAutocheckSchedule, resetWebhookScanState, webhookScanState } from '../server/index.js'
@@ -902,6 +902,38 @@ describe('qBittorrent torrent controls', () => {
       const uploaded = addBody.get('torrents')
       assert.equal(typeof uploaded?.arrayBuffer, 'function', 'the torrent bytes must be uploaded as a file field (a Blob)')
       assert.equal(addBody.get('tags'), 'seadex')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('fetchTorrentFile throws MagnetRedirectError when the download link redirects to a magnet URI', async () => {
+    // AnimeZ confirmed by hand: its "download" link has no raw .torrent file
+    // at all, it 302s straight to a magnet: URI, which fetch() cannot follow
+    // as a normal redirect.
+    const magnet = 'magnet:?xt=urn:btih:' + 'c'.repeat(40) + '&dn=Some+Release'
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(null, { status: 302, headers: { Location: magnet } })) as typeof fetch
+    try {
+      await assert.rejects(
+        () => fetchTorrentFile('https://animez.example/download/works'),
+        (error: unknown) => error instanceof MagnetRedirectError && error.magnet === magnet,
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('fetchTorrentFile follows an ordinary http redirect through to the torrent bytes', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url === 'https://tracker.example/download/works') return new Response(null, { status: 302, headers: { Location: 'https://tracker.example/actual-file' } })
+      return new Response('fake torrent bytes', { status: 200 })
+    }) as typeof fetch
+    try {
+      const bytes = await fetchTorrentFile('https://tracker.example/download/works')
+      assert.equal(bytes.toString(), 'fake torrent bytes')
     } finally {
       globalThis.fetch = originalFetch
     }

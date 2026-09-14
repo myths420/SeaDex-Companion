@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, fetchTorrentFile, forgetDownloadSource, forgetOwnedTorrents,
+  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, fetchTorrentFile, forgetDownloadSource, forgetOwnedTorrents, MagnetRedirectError,
   getDownloadSource, recordDownloadSource,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
@@ -473,6 +473,18 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     if (resume && !loadScanProgress()) {
       return sendJson(response, 409, { ok: false, error: 'No interrupted scan to continue' })
     }
+    // A single title's "Correct match" or its own rescan button shouldn't
+    // have to wait out a full library scan (which can run for hours) just to
+    // re-check the one thing that changed - scope it to that item alone, the
+    // same way an incremental webhook scan already does.
+    let scope: ScanScope = {}
+    let trigger: ScanTrigger = 'manual'
+    const libraryKeyMatch = String(data.library_key || '').match(/^(Sonarr|Radarr):item(\d+)$/)
+    if (libraryKeyMatch) {
+      const [, arr, id] = libraryKeyMatch
+      scope = arr === 'Sonarr' ? { sonarrIds: [Number(id)] } : { radarrIds: [Number(id)] }
+      trigger = arr === 'Sonarr' ? 'sonarr' : 'radarr'
+    }
     let config: Config
     try { config = loadConfig() } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -481,7 +493,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     }
     resetWebhookScanState(); autocheckState.pending = false
     setState({ running: true })
-    void runScan(config, {}, 'manual', {}, resume)
+    void runScan(config, {}, trigger, scope, resume)
     return sendJson(response, 200, { ok: true })
   }
 
@@ -548,8 +560,17 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
           // into its own "Add torrent" dialog even) - fetch the .torrent file
           // ourselves and hand qBittorrent the bytes directly instead of a
           // URL for it to fetch, sidestepping whatever it trips on.
-          const torrentFile = await fetchTorrentFile(prowlarrMatch.downloadUrl!)
-          resolvedHash = await qbAddTorrent(config, prowlarrMatch.downloadUrl!, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash, torrentFile)
+          try {
+            const torrentFile = await fetchTorrentFile(prowlarrMatch.downloadUrl!)
+            resolvedHash = await qbAddTorrent(config, prowlarrMatch.downloadUrl!, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash, torrentFile)
+          } catch (error) {
+            // Some indexers (AnimeZ confirmed by hand) have no raw .torrent
+            // file at all - their "download" link just redirects to a
+            // magnet: URI. Fall back to adding that magnet directly instead
+            // of failing the whole download.
+            if (!(error instanceof MagnetRedirectError)) throw error
+            resolvedHash = await qbAddTorrent(config, error.magnet, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+          }
         }
         // The real hash of a Prowlarr-sourced torrent almost never matches
         // SeaDex's own info_hashes (different tracker, different upload) - the

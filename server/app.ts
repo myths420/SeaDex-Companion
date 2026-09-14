@@ -2063,12 +2063,37 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
  * credentials that shouldn't follow a redirect to somewhere unexpected) since
  * this fetch carries no headers of ours to leak.
  */
+/**
+ * Some indexers (AnimeZ confirmed by hand) have no raw .torrent file to serve
+ * at all - their "download" link is a redirect straight to a magnet: URI.
+ * fetch() can follow ordinary http(s) redirects but not a redirect to a
+ * non-http scheme, so this case has to be detected explicitly rather than
+ * left to throw a confusing raw fetch error. The caller catches this and
+ * falls back to adding the magnet directly instead of uploading file bytes.
+ */
+export class MagnetRedirectError extends Error {
+  constructor(public magnet: string) {
+    super('The download link redirects to a magnet URI instead of a torrent file')
+  }
+}
+
 export async function fetchTorrentFile(url: string, timeoutMs = 30_000): Promise<Buffer> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-  if (!response.ok) throw new Error(`Could not fetch the torrent file (HTTP ${response.status})`)
-  const bytes = Buffer.from(await response.arrayBuffer())
-  if (!bytes.length) throw new Error('The torrent file link returned an empty response')
-  return bytes
+  let current = url
+  for (let redirects = 0; redirects < 5; redirects++) {
+    const response = await fetch(current, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' })
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location')
+      if (!location) throw new Error(`Could not fetch the torrent file (HTTP ${response.status} redirect with no Location header)`)
+      if (location.startsWith('magnet:')) throw new MagnetRedirectError(location)
+      current = new URL(location, current).toString()
+      continue
+    }
+    if (!response.ok) throw new Error(`Could not fetch the torrent file (HTTP ${response.status})`)
+    const bytes = Buffer.from(await response.arrayBuffer())
+    if (!bytes.length) throw new Error('The torrent file link returned an empty response')
+    return bytes
+  }
+  throw new Error('Too many redirects while fetching the torrent file')
 }
 
 function isTimeoutLikeError(error: unknown): boolean {
