@@ -874,6 +874,39 @@ describe('qBittorrent torrent controls', () => {
     }
   })
 
+  test('uploads torrent file bytes directly instead of asking qBittorrent to fetch a URL', async () => {
+    // qBittorrent's own URL-based add proved unreliable for at least some
+    // tracker download links (silently added nothing for a link that worked
+    // fine on its own) - when the caller already has the file's bytes, the
+    // add must be a multipart upload of those bytes, not urls=<link>.
+    const hash = 'b'.repeat(40)
+    const originalFetch = globalThis.fetch
+    let addBody: any = null
+    let added = false
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/v2/auth/login')) return new Response('Ok.', { status: 200 })
+      if (url.endsWith('/api/v2/torrents/add')) { addBody = init?.body; added = true; return new Response('Ok.', { status: 200 }) }
+      // Doesn't exist yet for the pre-add duplicate check; exists once "added" for the post-add existence check.
+      if (url.includes('/api/v2/torrents/info')) return new Response(added ? JSON.stringify([{ hash }]) : '[]', { status: 200 })
+      return new Response('', { status: 200 })
+    }) as typeof fetch
+    try {
+      const result = await qbAddTorrent(
+        { ...DEFAULT_CONFIG, qbittorrent_url: 'http://qb.example', qbittorrent_user: 'admin', qbittorrent_pass: 'secret' },
+        'https://prowlarr.example/download/works', 'anime', [], undefined, undefined, hash,
+        Buffer.from('d8:announce...fake torrent bytes...'),
+      )
+      assert.equal(result, hash)
+      assert.equal(typeof addBody?.get, 'function', 'the add request must be a multipart form, not urlencoded')
+      const uploaded = addBody.get('torrents')
+      assert.equal(typeof uploaded?.arrayBuffer, 'function', 'the torrent bytes must be uploaded as a file field (a Blob)')
+      assert.equal(addBody.get('tags'), 'seadex')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('rejects misleading qBittorrent login responses', async () => {
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async () => new Response('Not Ok', { status: 200 })) as typeof fetch

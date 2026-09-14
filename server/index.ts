@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetDownloadSource, forgetOwnedTorrents,
+  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, fetchTorrentFile, forgetDownloadSource, forgetOwnedTorrents,
   getDownloadSource, recordDownloadSource,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
@@ -538,8 +538,19 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     const sourceLabel = prowlarrMatch ? prowlarrMatch.indexer : 'SeaDex'
     const operation = (async () => {
       if (prowlarrMatch) {
-        const link = prowlarrMatch.magnetUrl || prowlarrMatch.downloadUrl!
-        const resolvedHash = await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+        let resolvedHash: string | null
+        if (prowlarrMatch.magnetUrl) {
+          resolvedHash = await qbAddTorrent(config, prowlarrMatch.magnetUrl, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+        } else {
+          // qBittorrent's own URL-based add is unreliable for at least some
+          // tracker download links (confirmed by hand: qBittorrent silently
+          // added nothing for a link that resolves fine on its own, pasted
+          // into its own "Add torrent" dialog even) - fetch the .torrent file
+          // ourselves and hand qBittorrent the bytes directly instead of a
+          // URL for it to fetch, sidestepping whatever it trips on.
+          const torrentFile = await fetchTorrentFile(prowlarrMatch.downloadUrl!)
+          resolvedHash = await qbAddTorrent(config, prowlarrMatch.downloadUrl!, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash, torrentFile)
+        }
         // The real hash of a Prowlarr-sourced torrent almost never matches
         // SeaDex's own info_hashes (different tracker, different upload) - the
         // progress endpoints can't find it without this on record.

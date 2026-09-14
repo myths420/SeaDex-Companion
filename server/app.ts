@@ -2050,6 +2050,27 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
   return matches[0]
 }
 
+/**
+ * qBittorrent's own URL-based add (`urls=<downloadUrl>`) is unreliable for at
+ * least some Prowlarr/tracker download links - confirmed by hand: qBittorrent
+ * silently did nothing with a link that resolves fine on its own (pasting the
+ * same link into qBittorrent's "Add torrent" dialog also did nothing, while
+ * the same release's magnet worked immediately), and separately returns
+ * "Ok." for /torrents/add regardless. Fetching the .torrent file ourselves
+ * and uploading the bytes directly sidesteps whatever qBittorrent's own
+ * fetcher trips on - normal redirect-following is fine here (unlike
+ * fetchWithTimeout's manual mode, used where a request carries this app's own
+ * credentials that shouldn't follow a redirect to somewhere unexpected) since
+ * this fetch carries no headers of ours to leak.
+ */
+export async function fetchTorrentFile(url: string, timeoutMs = 30_000): Promise<Buffer> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!response.ok) throw new Error(`Could not fetch the torrent file (HTTP ${response.status})`)
+  const bytes = Buffer.from(await response.arrayBuffer())
+  if (!bytes.length) throw new Error('The torrent file link returned an empty response')
+  return bytes
+}
+
 function isTimeoutLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const name = (error as { name?: string }).name
@@ -2272,22 +2293,42 @@ async function qbWaitForTorrentToExist(config: Config, hash: string, timeoutMs =
 }
 
 /** Resolves to the torrent's info hash - the caller's own knownHash/magnet if available, otherwise whatever qbResolveAddedHash discovers after the add (see its comment). Throws if the add can't be confirmed to have actually happened. */
-export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<string | null> {
+export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string, torrentFile?: Buffer): Promise<string | null> {
   // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
   // release, which magnetInfoHash() can't parse a hash out of - the caller
   // passes the hash it already has (from Prowlarr's search result) instead.
   let hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
   if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
   const resolveTag = hash ? null : `seadex-resolve-${randomBytes(4).toString('hex')}`
+  const tags = resolveTag ? `seadex,${resolveTag}` : 'seadex'
   // Only the duplicate-check-then-add is under the lock (brief - this is what
   // actually needs to be atomic, to stop two concurrent adds of the same hash
   // both passing the check). The metadata wait that can follow does not hold
   // it - see qbSelectTorrentFiles.
   await withQbLock(async () => {
     if (hash && await qbTorrentExists(config, hash)) throw new Error('Torrent already exists in qBittorrent and was not marked as app-owned')
-    const body = new URLSearchParams({ urls: magnet, tags: resolveTag ? `seadex,${resolveTag}` : 'seadex' }); if (category) body.set('category', category)
-    if (selectedFiles.length) { body.set('paused', 'true'); body.set('stopped', 'true') }
-    const response = await qbRequest(config, '/api/v2/torrents/add', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })
+    // A caller that already fetched the actual .torrent file bytes (see
+    // fetchTorrentFile's comment on why) uploads them directly instead of
+    // asking qBittorrent to fetch the URL itself.
+    let body: BodyInit
+    let headers: Record<string, string> | undefined
+    if (torrentFile) {
+      const form = new FormData()
+      // TS's DOM lib types BlobPart against ArrayBufferView<ArrayBuffer> specifically,
+      // which a Node Buffer's broader ArrayBufferLike doesn't satisfy on paper -
+      // it's a valid BlobPart at runtime regardless.
+      form.set('torrents', new Blob([torrentFile as unknown as ArrayBuffer]), 'release.torrent')
+      form.set('tags', tags)
+      if (category) form.set('category', category)
+      if (selectedFiles.length) { form.set('paused', 'true'); form.set('stopped', 'true') }
+      body = form
+    } else {
+      const params = new URLSearchParams({ urls: magnet, tags }); if (category) params.set('category', category)
+      if (selectedFiles.length) { params.set('paused', 'true'); params.set('stopped', 'true') }
+      body = params
+      headers = { 'Content-Type': 'application/x-www-form-urlencoded' }
+    }
+    const response = await qbRequest(config, '/api/v2/torrents/add', { method: 'POST', headers, body })
     const text = await response.text()
     let accepted = response.status === 200 && text.includes('Ok')
     if (!accepted && response.status === 200) {
