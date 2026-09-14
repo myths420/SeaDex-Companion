@@ -142,6 +142,7 @@ export interface DownloadProgress {
   total_size: number
   speed: number
   state: string
+  source?: string | null
   error?: string
 }
 

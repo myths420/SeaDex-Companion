@@ -4,7 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetOwnedTorrents,
+  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, forgetDownloadSource, forgetOwnedTorrents,
+  getDownloadSource, recordDownloadSource,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
   resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
@@ -90,18 +91,21 @@ const downloadProgressStates = new Map<string, string>()
 const downloadProgressFailures = new Map<string, { message: string; lastLogged: number; suppressed: number }>()
 let bulkOperationActive = false
 
-function summarizeTorrentProgress(torrents: JsonObject[]): JsonObject {
+function summarizeTorrentProgress(torrents: JsonObject[], source?: string | null): JsonObject {
   let totalSize = 0; let downloaded = 0; let speed = 0
   const states: string[] = []
   for (const torrent of torrents) {
-    const size = Number(torrent.size || torrent.total_size || 0); const progress = Number(torrent.progress || 0)
+    // qBittorrent reports size as -1 while a torrent's metadata hasn't
+    // resolved yet (not 0) - left un-clamped this produced a nonsensical
+    // "-1 B" in the UI instead of just showing no size yet.
+    const size = Math.max(0, Number(torrent.size || torrent.total_size || 0)); const progress = Number(torrent.progress || 0)
     totalSize += size; downloaded += Math.trunc(size * progress); speed += Number(torrent.dlspeed || 0); states.push(String(torrent.state || 'unknown'))
   }
   const found = torrents.length > 0
   const progress = totalSize > 0 ? downloaded / totalSize : 0
   let state = normalizeQbStates(states)
   if (found && totalSize > 0 && progress >= 0.999) state = 'complete'
-  return { ok: true, found, progress: Math.round(progress * 10_000) / 10_000, downloaded, total_size: totalSize, speed, state }
+  return { ok: true, found, progress: Math.round(progress * 10_000) / 10_000, downloaded, total_size: totalSize, speed, state, source: source || null }
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -528,10 +532,16 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       record: (ownedHash: string) => recordOwnedTorrents([ownedHash]),
       forget: (ownedHash: string) => forgetOwnedTorrents([ownedHash]),
     }
+    const progressKey = `${key}\0${releaseIndex}`
+    const sourceLabel = prowlarrMatch ? prowlarrMatch.indexer : 'SeaDex'
     const operation = (async () => {
       if (prowlarrMatch) {
         const link = prowlarrMatch.magnetUrl || prowlarrMatch.downloadUrl!
-        await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+        const resolvedHash = await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
+        // The real hash of a Prowlarr-sourced torrent almost never matches
+        // SeaDex's own info_hashes (different tracker, different upload) - the
+        // progress endpoints can't find it without this on record.
+        recordDownloadSource(progressKey, { hash: resolvedHash, source: sourceLabel })
       } else {
         // A bare magnet:?xt=urn:btih:<hash> has no display name and, more
         // importantly, no tracker announce URLs at all - qBittorrent can only
@@ -544,7 +554,9 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
         // so this behaves like the manually-pasted case instead of relying on
         // DHT alone.
         const displayName = resultLabel(found.result!)
-        for (const hash of hashes) await qbAddTorrent(config, buildMagnet(hash, displayName), category, selectedFiles, undefined, ownership)
+        let lastHash: string | null = null
+        for (const hash of hashes) lastHash = await qbAddTorrent(config, buildMagnet(hash, displayName), category, selectedFiles, undefined, ownership)
+        recordDownloadSource(progressKey, { hash: lastHash, source: sourceLabel })
       }
     })()
     const logOutcome = (error: unknown) => {
@@ -770,9 +782,12 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       for (const result of resultsForRequest()) {
         if (!result.key) continue
         for (const [releaseIndex, release] of (result.releases || []).entries()) {
-          const hashes = (release.info_hashes || []).map((hash: unknown) => String(hash).toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash))
-          const matches = hashes.map((hash: string) => byHash.get(hash)).filter(Boolean) as JsonObject[]
-          if (matches.length) downloads[`${result.key}\0${releaseIndex}`] = summarizeTorrentProgress(matches)
+          const progressKey = `${result.key}\0${releaseIndex}`
+          const recordedSource = getDownloadSource(progressKey)
+          const hashes = new Set<string>((release.info_hashes || []).map((hash: unknown) => String(hash).toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash)))
+          if (recordedSource?.hash) hashes.add(recordedSource.hash)
+          const matches = [...hashes].map((hash: string) => byHash.get(hash)).filter(Boolean) as JsonObject[]
+          if (matches.length || recordedSource) downloads[progressKey] = summarizeTorrentProgress(matches, recordedSource?.source)
         }
       }
       return sendJson(response, 200, { ok: true, downloads })
@@ -790,7 +805,11 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     if (found.error) return sendJson(response, found.error[0], { ok: false, error: found.error[1] })
     const progressKey = `${key}\0${releaseIndex}`
     const details = releaseDetails(found.result!, found.release!, releaseIndex)
-    const hashes = (found.release!.info_hashes || []).map((hash: string) => hash.toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash))
+    const recordedSource = getDownloadSource(progressKey)
+    const hashes = [...new Set([
+      ...(found.release!.info_hashes || []).map((hash: string) => hash.toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash)),
+      ...(recordedSource?.hash ? [recordedSource.hash] : []),
+    ])]
     if (!hashes.length) return sendJson(response, 400, { ok: false, error: 'No magnet available for this release' })
     let torrents: JsonObject[]
     try { torrents = await qbGetTorrents(loadConfig(), hashes) }
@@ -812,7 +831,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       log('INFO', `Download status checks recovered: ${details}${previousFailure.suppressed ? ` (${previousFailure.suppressed} repeated error${previousFailure.suppressed === 1 ? '' : 's'} were suppressed)` : ''}`)
       downloadProgressFailures.delete(progressKey)
     }
-    const summary = summarizeTorrentProgress(torrents)
+    const summary = summarizeTorrentProgress(torrents, recordedSource?.source)
     const foundAny = Boolean(summary.found)
     const progress = Number(summary.progress)
     const state = String(summary.state)

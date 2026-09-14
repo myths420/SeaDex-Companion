@@ -2215,18 +2215,50 @@ export interface QbOwnershipHooks {
   forget: (hash: string) => void
 }
 
-export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<void> {
+async function qbCategoryHashes(config: Config, category?: string): Promise<Set<string>> {
+  const response = await qbRequest(config, `/api/v2/torrents/info${category ? `?category=${encodeURIComponent(category)}` : ''}`)
+  if (response.status !== 200) return new Set()
+  try { return new Set((JSON.parse(await response.text()) as JsonObject[]).map((torrent) => String(torrent.hash || '').toLowerCase())) }
+  catch { return new Set() }
+}
+
+/**
+ * A magnet URI carries its own hash, but a Prowlarr `downloadUrl` is a link
+ * to an actual .torrent file - qBittorrent doesn't know its hash until it has
+ * fetched and parsed that file, which happens asynchronously after
+ * /torrents/add already returned. Poll the category's torrent list for a hash
+ * that wasn't there before the add to find it. Unlike the metadata wait, this
+ * only needs the torrent to exist in qBittorrent's list, not to have resolved
+ * peers/files yet, so it resolves in a couple of seconds.
+ */
+async function qbResolveAddedHash(config: Config, category: string | undefined, beforeHashes: Set<string>, timeoutMs = 15_000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs
+  let pollDelay = 200
+  while (Date.now() < deadline) {
+    const current = await qbCategoryHashes(config, category)
+    const fresh = [...current].find((hash) => !beforeHashes.has(hash))
+    if (fresh) return fresh
+    await sleep(pollDelay)
+    pollDelay = Math.min(pollDelay * 2, 2000)
+  }
+  return null
+}
+
+/** Resolves to the torrent's info hash - the caller's own knownHash/magnet if available, otherwise whatever qbResolveAddedHash discovers after the add (see its comment). Null only if it could genuinely not be determined. */
+export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<string | null> {
   // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
   // release, which magnetInfoHash() can't parse a hash out of - the caller
   // passes the hash it already has (from Prowlarr's search result) instead.
-  const hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
+  let hash = (knownHash || magnetInfoHash(magnet) || '').toLowerCase() || null
   if (selectedFiles.length && !hash) throw new Error('Cannot select torrent files without a v1 info hash')
   // Only the duplicate-check-then-add is under the lock (brief - this is what
   // actually needs to be atomic, to stop two concurrent adds of the same hash
   // both passing the check). The metadata wait that can follow does not hold
   // it - see qbSelectTorrentFiles.
+  let beforeHashes: Set<string> | null = null
   await withQbLock(async () => {
     if (hash && await qbTorrentExists(config, hash)) throw new Error('Torrent already exists in qBittorrent and was not marked as app-owned')
+    if (!hash) beforeHashes = await qbCategoryHashes(config, category)
     const body = new URLSearchParams({ urls: magnet, tags: 'seadex' }); if (category) body.set('category', category)
     if (selectedFiles.length) { body.set('paused', 'true'); body.set('stopped', 'true') }
     const response = await qbRequest(config, '/api/v2/torrents/add', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })
@@ -2237,6 +2269,10 @@ export async function qbAddTorrent(config: Config, magnet: string, category?: st
     }
     if (!accepted) throw new Error(`qBittorrent rejected the torrent (HTTP ${response.status}: ${text.slice(0, 120)})`)
   })
+  if (!hash) {
+    hash = await qbResolveAddedHash(config, category, beforeHashes || new Set())
+    if (!hash) log('WARNING', `Added a torrent via ${category || 'no'} category but could not determine its info hash afterward - ownership tracking, dedupe, and progress display won't work for it`)
+  }
   try {
     if (hash) ownership?.record(hash)
     if (selectedFiles.length) await qbSelectTorrentFiles(config, hash!, selectedFiles, timeoutMs)
@@ -2251,6 +2287,7 @@ export async function qbAddTorrent(config: Config, magnet: string, category?: st
     throw error
   }
   qbCache = { data: null, timestamp: 0 }
+  return hash
 }
 
 export interface QbBulkAddEntry {
@@ -2470,6 +2507,47 @@ export function forgetOwnedTorrents(hashes: string[]): void {
 
 export function ownedTorrentsSnapshot(): string[] {
   return [...ownedTorrents].sort()
+}
+
+// ---------------------------------------------------------------------------
+// Per-download source record
+//
+// Progress tracking (and bulk cancellation) both match a release to a
+// qBittorrent torrent by SeaDex's own info_hashes - fine for a public-tracker
+// magnet where that hash IS the real one, but a Prowlarr-sourced download
+// almost always has a *different* hash (a different tracker's own upload of
+// the same content), so SeaDex's hash never matches anything in qBittorrent
+// and the download silently never shows progress even though it's running
+// fine. This records the real hash actually used, plus a human label for
+// where it came from, per (library key, release index) - so progress lookups
+// can fall back to it, and the UI can say "via AnimeZ" instead of nothing.
+// ---------------------------------------------------------------------------
+export const DOWNLOAD_SOURCES_FILE = join(DATA_DIR, 'download_sources.json')
+
+export interface DownloadSource {
+  hash: string | null
+  source: string
+}
+
+function loadDownloadSources(): Record<string, DownloadSource> {
+  return readJson<Record<string, DownloadSource>>(DOWNLOAD_SOURCES_FILE, {})
+}
+
+export function recordDownloadSource(progressKey: string, source: DownloadSource): void {
+  const all = loadDownloadSources()
+  all[progressKey] = source
+  writeJsonAtomic(DOWNLOAD_SOURCES_FILE, all)
+}
+
+export function getDownloadSource(progressKey: string): DownloadSource | null {
+  return loadDownloadSources()[progressKey] || null
+}
+
+export function forgetDownloadSource(progressKey: string): void {
+  const all = loadDownloadSources()
+  if (!(progressKey in all)) return
+  delete all[progressKey]
+  writeJsonAtomic(DOWNLOAD_SOURCES_FILE, all)
 }
 
 export function normalizeQbStates(states: string[]): string {

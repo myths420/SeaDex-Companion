@@ -803,6 +803,43 @@ describe('qBittorrent torrent controls', () => {
     assert.ok(requests.some((url) => url.endsWith('/api/v2/torrents/delete')))
   })
 
+  test('resolves the info hash after adding a Prowlarr .torrent-file link with no known hash', async () => {
+    // A Prowlarr `downloadUrl` is a link to an actual .torrent file, not a
+    // magnet - qBittorrent doesn't know its hash until it has fetched and
+    // parsed that file, which happens asynchronously after /torrents/add
+    // already returned. qbAddTorrent has to discover it afterward by diffing
+    // the category's torrent list, or ownership tracking, dedupe, and
+    // progress display all silently stop working for that download.
+    const resolvedHash = 'c'.repeat(40)
+    const originalFetch = globalThis.fetch
+    let infoCallCount = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/api/v2/auth/login')) return new Response('Ok.', { status: 200 })
+      if (url.includes('/api/v2/torrents/info')) {
+        infoCallCount += 1
+        // First call (pre-add snapshot) sees nothing; later calls (post-add
+        // polling) see the newly appeared torrent.
+        const torrents = infoCallCount === 1 ? [] : [{ hash: resolvedHash }]
+        return new Response(JSON.stringify(torrents), { status: 200 })
+      }
+      if (url.endsWith('/api/v2/torrents/add')) return new Response('Ok.', { status: 200 })
+      return new Response('', { status: 200 })
+    }) as typeof fetch
+    let recorded: string | null = null
+    try {
+      const result = await qbAddTorrent(
+        { ...DEFAULT_CONFIG, qbittorrent_url: 'http://qb.example', qbittorrent_user: 'admin', qbittorrent_pass: 'secret' },
+        'https://prowlarr.example/download/123', 'anime', [], undefined,
+        { record: (hash) => { recorded = hash }, forget: () => undefined },
+      )
+      assert.equal(result, resolvedHash)
+      assert.equal(recorded, resolvedHash)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('rejects misleading qBittorrent login responses', async () => {
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async () => new Response('Not Ok', { status: 200 })) as typeof fetch

@@ -185,6 +185,7 @@ export default function Card({ group, index, config, hidden = false, onToggle, o
           downloaded: p.downloaded,
           total_size: p.total_size,
           speed: p.speed,
+          source: p.source,
         },
       },
     }))
@@ -219,8 +220,13 @@ export default function Card({ group, index, config, hidden = false, onToggle, o
           return ownedGroups.some((h) => h.toLowerCase() === rel.releaseGroup.toLowerCase())
         }
         for (const { rel, index } of uniqueReleases(season.releases || [])) {
-          if (!rel.downloadable || owned(rel)) continue
+          if (owned(rel)) continue
           const progress = downloads[`${season.key}\0${index}`]
+          // A Prowlarr-sourced download for a release SeaDex has no magnet for
+          // at all (rel.downloadable false) still has real progress recorded
+          // server-side via its resolved hash - don't skip it just because
+          // SeaDex itself never offered a link for it.
+          if (!rel.downloadable && !progress) continue
           if (progress?.found) applyProgress(season.key, index, progress)
         }
       }
@@ -569,6 +575,7 @@ interface DlState {
   downloaded: number
   total_size: number
   speed: number
+  source?: string | null
 }
 
 const IDLE_DL: DlState = {
@@ -792,17 +799,20 @@ function Season({ r, config, tone, dl, busyDownload, onDownload, onPause, onResu
                         </div>
                         <div className="flex items-center gap-2">
                           <div className="min-w-0 flex-1 overflow-hidden text-xs font-semibold text-ellipsis whitespace-nowrap text-accent-bright tabular-nums">
-                            {dlState.phase === 'sending'
-                              ? 'Sending to qBittorrent…'
-                              : dlState.phase === 'paused'
-                              ? `Paused · ${pct.toFixed(1)}% · ${formatBytes(dlState.downloaded)} / ${formatBytes(dlState.total_size)}`
-                              : dlState.total_size > 0
-                              ? [
-                                  `${pct.toFixed(1)}% · ${formatBytes(dlState.downloaded)} / ${formatBytes(dlState.total_size)}`,
-                                  dlState.speed > 0 ? formatBytes(dlState.speed) + '/s' : '',
-                                  formatEta(Math.max(0, dlState.total_size - dlState.downloaded), dlState.speed),
-                                ].filter(Boolean).join(' · ')
-                              : 'Waiting for torrent metadata…'}
+                            {[
+                              dlState.phase === 'sending'
+                                ? 'Sending to qBittorrent…'
+                                : dlState.phase === 'paused'
+                                ? `Paused · ${pct.toFixed(1)}% · ${formatBytes(dlState.downloaded)} / ${formatBytes(dlState.total_size)}`
+                                : dlState.total_size > 0
+                                ? [
+                                    `${pct.toFixed(1)}% · ${formatBytes(dlState.downloaded)} / ${formatBytes(dlState.total_size)}`,
+                                    dlState.speed > 0 ? formatBytes(dlState.speed) + '/s' : '',
+                                    formatEta(Math.max(0, dlState.total_size - dlState.downloaded), dlState.speed),
+                                  ].filter(Boolean).join(' · ')
+                                : 'Waiting for torrent metadata…',
+                              dlState.source ? `via ${dlState.source}` : '',
+                            ].filter(Boolean).join(' · ')}
                           </div>
                           {activeEntry && <DownloadActions
                             entry={activeEntry}
