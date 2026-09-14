@@ -156,6 +156,23 @@ test('account setup, authenticated access, revocation, and login throttling work
   assert.match(String((await invalidSchedule.json()).error), /at least one day/)
   assert.equal((await fetch(`${baseUrl}/api/scan/cancel`, { method: 'POST', headers: { Cookie: updatedCookie } })).status, 409)
 
+  assert.equal((await fetch(`${baseUrl}/api/diagnostics/logs`)).status, 404, 'diagnostics must be disabled until a key is configured')
+  const diagnosticsKey = 'test-diagnostics-key-12345'
+  assert.equal((await fetch(`${baseUrl}/api/config`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: updatedCookie },
+    body: JSON.stringify({ diagnostics_api_key: diagnosticsKey }),
+  })).status, 200)
+  assert.equal((await fetch(`${baseUrl}/api/diagnostics/logs`)).status, 401, 'no key at all')
+  assert.equal((await fetch(`${baseUrl}/api/diagnostics/logs?key=wrong`)).status, 401, 'wrong key')
+  assert.equal((await fetch(`${baseUrl}/api/diagnostics/status`, { headers: { Cookie: updatedCookie } })).status, 401,
+    'the login session must not substitute for the diagnostics key')
+  const diagnosticsLogs = await fetch(`${baseUrl}/api/diagnostics/logs`, { headers: { 'X-Diagnostics-Key': diagnosticsKey } })
+  assert.equal(diagnosticsLogs.status, 200)
+  assert.ok(Array.isArray((await diagnosticsLogs.json()).lines))
+  const diagnosticsStatus = await fetch(`${baseUrl}/api/diagnostics/status?key=${diagnosticsKey}`)
+  assert.equal(diagnosticsStatus.status, 200)
+  assert.equal(typeof (await diagnosticsStatus.json()).running, 'boolean')
+
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const failed = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',

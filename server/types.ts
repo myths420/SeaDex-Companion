@@ -28,6 +28,7 @@ export interface Config extends JsonObject {
   prowlarr_url: string
   prowlarr_key: string
   prowlarr_indexer_ids: number[]
+  diagnostics_api_key: string
 }
 
 export interface ProwlarrIndexer {

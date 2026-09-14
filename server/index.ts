@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import { createReadStream, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
@@ -231,6 +232,32 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return sendJson(response, 200, { ok: true }, {
       'Cache-Control': 'no-store', 'Set-Cookie': expiredSessionCookie(request),
     })
+  }
+
+  // Read-only diagnostics, gated by their own API key instead of the admin
+  // session - lets an external tool (or an AI assistant helping debug) pull
+  // logs/status without ever touching the login password. Disabled entirely
+  // (404, not 401) until a key is actually configured, so it adds no surface
+  // for installs that never set one.
+  if (path === '/api/diagnostics/logs' || path === '/api/diagnostics/status') {
+    const configuredKey = String(loadConfig().diagnostics_api_key || '')
+    if (!configuredKey) return sendJson(response, 404, { error: 'Not found' })
+    const providedKey = String(request.headers['x-diagnostics-key'] || url.searchParams.get('key') || '')
+    const expected = Buffer.from(configuredKey); const actual = Buffer.from(providedKey)
+    const valid = actual.length === expected.length && timingSafeEqual(actual, expected)
+    if (!valid) return sendJson(response, 401, { error: 'Invalid diagnostics key' }, { 'Cache-Control': 'no-store' })
+    if (path === '/api/diagnostics/logs') {
+      const requested = Number.parseInt(url.searchParams.get('lines') || '500', 10)
+      const count = Math.max(1, Math.min(Number.isFinite(requested) ? requested : 500, 2000))
+      const lines = readLogTail().slice(-count)
+      return sendJson(response, 200, { lines, total: lines.length }, { 'Cache-Control': 'no-store' })
+    }
+    const state = getState()
+    return sendJson(response, 200, {
+      running: state.running, progress: state.progress, total: state.total, message: state.message,
+      error: state.error, cancelled: state.cancelled, trigger: state.trigger, source_errors: state.source_errors,
+      last_run: state.last_run,
+    }, { 'Cache-Control': 'no-store' })
   }
 
   if (path.startsWith('/api/') && !isAuthenticated(request)) {

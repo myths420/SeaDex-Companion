@@ -41,6 +41,7 @@ export const DEFAULT_CONFIG: Config = {
   prowlarr_url: '',
   prowlarr_key: '',
   prowlarr_indexer_ids: [],
+  diagnostics_api_key: '',
   scan_schedule: {
     enabled: true,
     mode: 'interval',
@@ -53,7 +54,7 @@ export const DEFAULT_CONFIG: Config = {
   hidden: [],
 }
 
-export const SECRET_CONFIG_KEYS = ['sonarr_key', 'radarr_key', 'qbittorrent_pass', 'webhook', 'prowlarr_key'] as const
+export const SECRET_CONFIG_KEYS = ['sonarr_key', 'radarr_key', 'qbittorrent_pass', 'webhook', 'prowlarr_key', 'diagnostics_api_key'] as const
 export type SecretConfigKey = typeof SECRET_CONFIG_KEYS[number]
 
 export function arrBaseUrl(value: unknown): string {

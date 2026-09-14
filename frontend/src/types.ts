@@ -135,6 +135,8 @@ export interface Config {
   prowlarr_key: string
   prowlarr_key_configured: boolean
   prowlarr_indexer_ids: number[]
+  diagnostics_api_key: string
+  diagnostics_api_key_configured: boolean
 }
 
 export interface ProwlarrIndexer {
