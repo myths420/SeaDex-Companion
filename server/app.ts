@@ -1434,7 +1434,20 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
       const arrUrl = arrItemUrl(config, item)
       const libraryKey = libraryItemKey(item)
       const mappingId = rules.mappings[libraryKey]
-      const chain = await (dependencies.anilistChain || anilistChain)(item.title, cache, {}, mappingId)
+      let chain: ChainEntry[]
+      try {
+        chain = await (dependencies.anilistChain || anilistChain)(item.title, cache, {}, mappingId)
+      } catch (error) {
+        // A single title's AniList lookup can fail outright during an AniList
+        // outage (bulk 404s). Don't let it abort the whole scan and discard
+        // everything resolved so far — carry the item's previous result
+        // forward (if any) and keep going; it'll be retried next scan.
+        log('WARNING', `AniList lookup failed for "${item.title}", keeping previous result and continuing: ${errorMessage(error)}`)
+        const carried = previousResults.filter((result) => String(result.library_key || '') === libraryKey)
+        results.push(...carried)
+        setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+        continue
+      }
       const seasonEntries = Object.entries(item.seasons).map(([season, local]) => [Number(season), local as JsonObject] as const).sort(([a], [b]) => a - b)
       if (!chain.length) {
         log('WARNING', `${mappingId ? `Manual AniList override ${mappingId} produced no match for` : 'No AniList match for'}: ${item.title}`)

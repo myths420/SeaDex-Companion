@@ -1058,6 +1058,27 @@ describe('release selection and combined cours', () => {
     assert.match(getState().error || '', /Sonarr unavailable/)
   })
 
+  test('carries a title forward and keeps scanning when its AniList lookup fails mid-scan', async () => {
+    setState({ results: [{ key: 'old', library_key: 'Sonarr:item1', title: 'Flaky', arr: 'Sonarr', status: 'best' }] })
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: (async () => new Map()) as any,
+      localItems: (async () => [
+        { arr: 'Sonarr', id: 1, title: 'Flaky', seasons: { 1: { groups: ['A'], size: 100 } } },
+        { arr: 'Sonarr', id: 2, title: 'Fine', seasons: { 1: { groups: [], size: 0 } } },
+      ]) as any,
+      anilistChain: (async (title: string) => {
+        if (title === 'Flaky') throw new Error('AniList request failed after 6 attempts: HTTP 404')
+        return []
+      }) as any,
+      loadCache: () => ({}), saveLastResults: () => undefined,
+      autoNotifyNew: async () => 0,
+    })
+    const state = getState()
+    assert.equal(state.error, null, 'a single title failure must not fail the whole scan')
+    assert.deepEqual(state.results.map((item) => item.title), ['Flaky', 'Fine'])
+    assert.equal(state.results[0].status, 'best', 'the previous result for the failed title should be carried forward untouched')
+  })
+
   test('preserves prior results when a scan is cancelled', async () => {
     setState({ results: [{ key: 'old', title: 'Preserved' }], last_run: 'before' })
     let releaseScan!: () => void
