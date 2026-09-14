@@ -336,7 +336,7 @@ export function saveConfig(config: Config): void {
 }
 export function loadCache(): JsonObject { return readJson<JsonObject>(CACHE_FILE, {}) }
 export function saveCache(cache: JsonObject): void { writeJsonAtomic(CACHE_FILE, cache, true) }
-export function saveLastResults(results: JsonObject[], lastRun: string): void {
+export function saveLastResults(results: JsonObject[], lastRun: string | null): void {
   writeJsonAtomic(RESULTS_FILE, { results, last_run: lastRun })
 }
 export function loadLastResults(): JsonObject | null { return readJson<JsonObject | null>(RESULTS_FILE, null) }
@@ -1397,7 +1397,11 @@ export interface ScanDependencies {
   loadUserRules?: typeof loadUserRules
   recordScanHistory?: (previous: JsonObject[], current: JsonObject[], runAt: string, file?: string, trigger?: ScanTrigger, metadata?: { durationSeconds?: number; scannedTitles?: number; sourceErrors?: Record<string, string>; outcome?: ScanHistoryEntry['outcome']; error?: string }) => ScanHistoryEntry
   syncSonarrSeasonMonitoring?: typeof syncSonarrSeasonMonitoring
+  checkpointIntervalMs?: number
 }
+
+/** How often an in-progress scan's results are written to disk (see the checkpoint comment in runScan). */
+export const CHECKPOINT_INTERVAL_MS = 20_000
 
 /**
  * Unmonitors (in Sonarr) any season this scan just tagged "best quality" -
@@ -1453,6 +1457,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
   const controller = new AbortController()
   activeScanController = controller
   let stage = 'initializing'
+  let checkpointed = false
   try {
     const enabledSources = [config.sonarr_url && config.sonarr_key ? 'Sonarr' : '', config.radarr_url && config.radarr_key ? 'Radarr' : ''].filter(Boolean)
     log('INFO', `Scan started (trigger: ${trigger}; sources: ${enabledSources.join(', ') || 'none configured'}; Discord notifications: ${config.notify_enabled && config.webhook ? 'enabled' : 'disabled'})`)
@@ -1484,6 +1489,23 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
       return !['Sonarr', 'Radarr'].includes(source)
     })
     const results: JsonObject[] = []
+    // The disk copy of scan results was previously only written once, after
+    // the whole loop finished - a container restart mid-scan (e.g. pulling a
+    // new image) killed the process before that ever happened, discarding
+    // every title already resolved this run even though most of them
+    // succeeded. Checkpoint the in-progress results to disk periodically so a
+    // restart resumes from something close to where it left off instead of
+    // from nothing. last_run is deliberately left at its previous value -
+    // only a scan that actually finishes counts as "completed".
+    const checkpointIntervalMs = dependencies.checkpointIntervalMs ?? CHECKPOINT_INTERVAL_MS
+    let lastCheckpointAt = Date.now()
+    const checkpoint = (allResults: JsonObject[]) => {
+      const now = Date.now()
+      if (now - lastCheckpointAt < checkpointIntervalMs) return
+      lastCheckpointAt = now
+      try { (dependencies.saveLastResults || saveLastResults)(allResults, previousState.last_run); checkpointed = true }
+      catch (error) { log('WARNING', `Could not checkpoint in-progress scan results: ${errorMessage(error)}`) }
+    }
     stage = 'resolving library titles'
     for (const [itemIndex, item] of items.entries()) {
       if (controller.signal.aborted) throw new DOMException('Scan cancelled', 'AbortError')
@@ -1503,6 +1525,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
         const carried = previousResults.filter((result) => String(result.library_key || '') === libraryKey)
         results.push(...carried)
         setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+        checkpoint([...retainedResults, ...results])
         continue
       }
       const seasonEntries = Object.entries(item.seasons).map(([season, local]) => [Number(season), local as JsonObject] as const).sort(([a], [b]) => a - b)
@@ -1516,6 +1539,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
           banner: null, anilist_id: null, arr_url: arrUrl,
         })
         setState({ progress: itemIndex + 1, results: [...results] })
+        checkpoint([...retainedResults, ...results])
         continue
       }
       for (const [season, local] of seasonEntries) {
@@ -1610,6 +1634,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
         }
       }
       setState({ progress: itemIndex + 1, results: [...retainedResults, ...results] })
+      checkpoint([...retainedResults, ...results])
     }
     if (controller.signal.aborted) throw new DOMException('Scan cancelled', 'AbortError')
     const lastRun = timestamp()
@@ -1652,6 +1677,13 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
     } else {
       log('ERROR', `Scan failed while ${stage} after ${((Date.now() - started) / 1000).toFixed(1)}s: ${message}`)
       setState({ ...previousState, running: true, cancelled: false, error: message })
+    }
+    if (checkpointed) {
+      // A checkpoint from this now-aborted run landed on disk earlier - put
+      // the last genuinely completed scan's data back so a restart doesn't
+      // pick up half-finished results as if they were real.
+      try { (dependencies.saveLastResults || saveLastResults)(previousState.results, previousState.last_run) }
+      catch (error) { log('WARNING', `Could not restore checkpointed results after the scan ${outcome}: ${errorMessage(error)}`) }
     }
     if (!dependencies.saveLastResults) {
       try { recordScanHistory(previousState.results, previousState.results, timestamp(), HISTORY_FILE, trigger, { durationSeconds: Math.round((Date.now() - started) / 100) / 10, scannedTitles: 0, outcome, error: cancelled ? 'Cancelled by user' : message }) }

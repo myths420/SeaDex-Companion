@@ -1347,6 +1347,54 @@ describe('Sonarr season monitoring sync', () => {
   })
 })
 
+describe('mid-scan checkpointing', () => {
+  test('persists in-progress results to disk during the scan, not only at the end', async () => {
+    const saves: { results: JsonObject[]; lastRun: string | null }[] = []
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: async () => new Map(),
+      localItems: async () => [
+        { arr: 'Sonarr', id: 1, title: 'First', seasons: { 1: { groups: [], size: 0 } } },
+        { arr: 'Sonarr', id: 2, title: 'Second', seasons: { 1: { groups: [], size: 0 } } },
+      ],
+      anilistChain: async () => [],
+      loadCache: () => ({}),
+      saveLastResults: (results: JsonObject[], lastRun: string | null) => { saves.push({ results: [...results], lastRun }) },
+      autoNotifyNew: async () => 0,
+      checkpointIntervalMs: 0,
+    })
+    assert.ok(saves.length >= 3, `expected checkpoints during the loop plus a final save, got ${saves.length}`)
+    assert.equal(saves[0].lastRun, null, 'a checkpoint before completion must not claim last_run yet')
+    assert.equal(saves[0].results.length, 1, 'the first checkpoint should only have the first item resolved so far')
+    const final = saves[saves.length - 1]
+    assert.ok(final.lastRun, 'the final save must set last_run')
+    assert.equal(final.results.length, 2)
+  })
+
+  test('restores the last good results on disk if a checkpoint fired before the scan failed', async () => {
+    const saves: { results: JsonObject[]; lastRun: string | null }[] = []
+    let call = 0
+    await runScan({ sonarr_url: 'http://sonarr/api/v3' }, {
+      seadexBest: async () => new Map(),
+      localItems: async () => [{ arr: 'Sonarr', id: 1, title: 'First', seasons: { 1: { groups: [], size: 0 } } }],
+      anilistChain: async () => [],
+      loadCache: () => ({}),
+      saveLastResults: (results: JsonObject[], lastRun: string | null) => {
+        call += 1
+        saves.push({ results: [...results], lastRun })
+        if (call === 2) throw new Error('disk full')
+      },
+      autoNotifyNew: async () => 0,
+      checkpointIntervalMs: 0,
+    })
+    assert.equal(saves.length, 3, 'expected: mid-scan checkpoint, the failed final save, then the restore')
+    assert.equal(saves[0].lastRun, null)
+    assert.equal(saves[1].results.length, 1, 'the failed final save attempted to persist the completed results')
+    assert.deepEqual(saves[2].results, [], 'the restore should put back the pre-scan (empty) results')
+    assert.equal(saves[2].lastRun, null)
+    assert.equal(getState().error, 'disk full')
+  })
+})
+
 describe('update checking', () => {
   test('reports a newer GitHub release and caches the result', async () => {
     const originalFetch = globalThis.fetch
