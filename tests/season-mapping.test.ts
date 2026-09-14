@@ -1336,6 +1336,31 @@ describe('Prowlarr fallback for private-tracker releases', () => {
       assert.equal(result, null)
     } finally { restore() }
   })
+
+  test('matches a season-1 release even when the title has no season marker at all', async () => {
+    // Real case: SeaDex Companion's "11eyes" search returned this exact
+    // Animez.to torrent, but the app still fell back to SeaDex because
+    // nothing in the title says "S01" - completely normal for a single-
+    // season show, which almost never bothers disambiguating a season.
+    const restore = mockProwlarrSearch([
+      { title: '11 Eyes + OVA (2009) [Tsundere] [10-bit]', protocol: 'torrent', indexer: 'Animez', seeders: 6, downloadUrl: 'http://prowlarr:9696/dl/11eyes', infoHash: 'd'.repeat(40) },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: '11eyes' }, { releaseGroup: 'Tsundere' }, 1)
+      assert.ok(result, 'expected the season-1 release with no season marker to still match')
+      assert.equal(result!.indexer, 'Animez')
+    } finally { restore() }
+  })
+
+  test('still requires a season marker from season 2 onward, to avoid picking season 1 by mistake', async () => {
+    const restore = mockProwlarrSearch([
+      { title: 'Some Anime [Group][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerA', seeders: 20, downloadUrl: 'http://prowlarr:9696/dl/s1' },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group' }, 2)
+      assert.equal(result, null, 'an unmarked title should not be assumed to be season 2')
+    } finally { restore() }
+  })
 })
 
 describe('Sonarr season monitoring sync', () => {

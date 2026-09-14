@@ -1970,7 +1970,13 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
   // require it to appear as its own tag/word (bounded by anything that isn't a
   // letter or digit) instead of anywhere inside a longer name.
   const groupPattern = group ? new RegExp(`(^|[^a-z0-9])${group.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i') : null
-  const seasonTag = season > 0 ? `s${String(season).padStart(2, '0')}` : null
+  // Anime torrent titles almost never carry a season marker unless there's a
+  // sequel to disambiguate from - a plain, single-season release ("11 Eyes +
+  // OVA (2009) [Tsundere] [10-bit]") has no "S01" anywhere in it, so
+  // requiring one for season 1 rejected an otherwise-correct group match.
+  // Only start requiring it from season 2 on, where a title collision with
+  // an earlier season is the actual risk this check exists to catch.
+  const seasonTag = season > 1 ? `s${String(season).padStart(2, '0')}` : null
   const matches = results.filter((result) => {
     if (!result.downloadUrl && !result.magnetUrl) return false
     const name = String(result.title || '').toLowerCase()
