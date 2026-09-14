@@ -495,7 +495,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
         const link = prowlarrMatch.magnetUrl || prowlarrMatch.downloadUrl!
         await qbAddTorrent(config, link, category, selectedFiles, undefined, ownership, prowlarrMatch.infoHash)
       } else {
-        for (const hash of hashes) await qbAddTorrent(config, `magnet:?xt=urn:btih:${hash}`, category, selectedFiles, undefined, ownership)
+        // A bare magnet has nothing for qBittorrent to show but the raw
+        // info-hash until real metadata arrives - a magnet copied by hand
+        // usually carries the tracker's own &dn= (display name), which is why
+        // that shows a proper name immediately and this didn't. Add one so
+        // the torrent reads as this release from the moment it's added,
+        // metadata timing notwithstanding.
+        const displayName = encodeURIComponent(resultLabel(found.result!))
+        for (const hash of hashes) await qbAddTorrent(config, `magnet:?xt=urn:btih:${hash}&dn=${displayName}`, category, selectedFiles, undefined, ownership)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
