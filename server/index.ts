@@ -464,17 +464,21 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     if (found.error) return sendJson(response, found.error[0], { ok: false, error: found.error[1] })
     const hashes = (found.release!.info_hashes || []).map((hash: string) => hash.toLowerCase()).filter((hash: string) => /^[0-9a-f]{40}$/.test(hash))
     const config = loadConfig()
-    let prowlarrMatch: Awaited<ReturnType<typeof findProwlarrRelease>> = null
-    if (!hashes.length) {
-      prowlarrMatch = await findProwlarrRelease(config, found.result!, found.release!, Number(found.result!.season) || 0)
-      if (!prowlarrMatch) {
-        return sendJson(response, 400, {
-          ok: false,
-          error: config.prowlarr_url
-            ? 'No magnet available for this release (private tracker), and no matching release was found on Prowlarr'
-            : 'No magnet available for this release (private tracker). Configure Prowlarr in Settings to search your indexers for it.',
-        })
-      }
+    // Prowlarr is tried first, not just as a fallback for a release SeaDex has
+    // no hash for at all. A bare SeaDex hash is a DHT-only magnet with no
+    // announce URLs; even when SeaDex does list one, the swarm can be
+    // unseeded outside whatever tracker actually hosts it, leaving qBittorrent
+    // stuck at 0 peers indefinitely. Prowlarr's own indexers give a real
+    // tracker link (announce + passkey where needed), which resolves far more
+    // reliably - so prefer it whenever a match exists.
+    const prowlarrMatch = await findProwlarrRelease(config, found.result!, found.release!, Number(found.result!.season) || 0)
+    if (!prowlarrMatch && !hashes.length) {
+      return sendJson(response, 400, {
+        ok: false,
+        error: config.prowlarr_url
+          ? 'No magnet available for this release (private tracker), and no matching release was found on Prowlarr'
+          : 'No magnet available for this release (private tracker). Configure Prowlarr in Settings to search your indexers for it.',
+      })
     }
     const category = String(config[`${String(found.result!.arr).toLowerCase()}_category`] || '').trim()
     const selectedFiles = Array.isArray(found.release!.selected_files) ? found.release!.selected_files.map(String) : []
