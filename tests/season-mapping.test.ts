@@ -785,10 +785,13 @@ describe('qBittorrent torrent controls', () => {
     const originalFetch = globalThis.fetch
     const requests: string[] = []
     const hash = 'e'.repeat(40)
+    let added = false
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input); requests.push(url)
       if (url.endsWith('/api/v2/auth/login')) return new Response('Ok.', { status: 200 })
-      if (url.includes('/api/v2/torrents/info?')) return new Response('[]', { status: 200 })
+      if (url.endsWith('/api/v2/torrents/add')) { added = true; return new Response('Ok.', { status: 200 }) }
+      // Doesn't exist yet for the pre-add duplicate check; exists once "added" for the post-add existence check.
+      if (url.includes('/api/v2/torrents/info?')) return new Response(added ? JSON.stringify([{ hash }]) : '[]', { status: 200 })
       return new Response('Ok.', { status: 200 })
     }) as typeof fetch
     try {

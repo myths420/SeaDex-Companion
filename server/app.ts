@@ -2252,6 +2252,25 @@ async function qbResolveAddedHash(config: Config, tag: string, timeoutMs = 8_000
   return null
 }
 
+/**
+ * Even when the hash is already known upfront (Prowlarr reported infoHash, or
+ * it came straight from a magnet), /torrents/add's "Ok." still doesn't mean
+ * qBittorrent actually turned the given URL into a real torrent - the same
+ * silent-failure risk qbResolveAddedHash exists for applies here too, just
+ * with the hash known in advance instead of discovered after. Confirm it
+ * actually exists before trusting the add.
+ */
+async function qbWaitForTorrentToExist(config: Config, hash: string, timeoutMs = 8_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  let pollDelay = 200
+  while (Date.now() < deadline) {
+    if (await qbTorrentExists(config, hash)) return true
+    await sleep(pollDelay)
+    pollDelay = Math.min(pollDelay * 2, 2000)
+  }
+  return false
+}
+
 /** Resolves to the torrent's info hash - the caller's own knownHash/magnet if available, otherwise whatever qbResolveAddedHash discovers after the add (see its comment). Throws if the add can't be confirmed to have actually happened. */
 export async function qbAddTorrent(config: Config, magnet: string, category?: string, selectedFiles: string[] = [], timeoutMs = QB_METADATA_TIMEOUT_MS, ownership?: QbOwnershipHooks, knownHash?: string): Promise<string | null> {
   // `magnet` is also used as a plain https download URL for a Prowlarr-sourced
@@ -2279,6 +2298,13 @@ export async function qbAddTorrent(config: Config, magnet: string, category?: st
   if (!hash) {
     hash = await qbResolveAddedHash(config, resolveTag!)
     if (!hash) throw new Error('qBittorrent reported the torrent as added, but it never actually appeared - the source link may be invalid, expired, or unreachable')
+  } else if (!selectedFiles.length && !await qbWaitForTorrentToExist(config, hash)) {
+    // A file-selecting download's own metadata wait below already verifies
+    // existence (more thoroughly, over a much longer budget) - only a full
+    // download with nothing after this point needs its own quick check, or a
+    // dead link would otherwise be reported as a successful "Download added"
+    // with nothing to show for it.
+    throw new Error('qBittorrent reported the torrent as added, but it never actually appeared - the source link may be invalid, expired, or unreachable')
   }
   try {
     if (hash) ownership?.record(hash)
