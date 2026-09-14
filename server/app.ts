@@ -1749,8 +1749,15 @@ let qbSession: QbSession | null = null
 let qbCache: { data: JsonObject[] | null; timestamp: number } = { data: null, timestamp: 0 }
 let qbQueue: Promise<void> = Promise.resolve()
 
-/** Per-torrent budget for qBittorrent to fetch magnet metadata. */
-export const QB_METADATA_TIMEOUT_MS = 15_000
+/**
+ * Per-torrent budget for qBittorrent to fetch magnet metadata. 15s was too
+ * tight in practice - DHT/PEX peer discovery for a freshly-added magnet
+ * routinely takes longer than that even when the swarm is healthy (verified
+ * by hand: the same magnet resolves fine in qBittorrent's own UI, just not
+ * within 15s), so every file-selecting download was failing and deleting
+ * the torrent before metadata had a real chance to arrive.
+ */
+export const QB_METADATA_TIMEOUT_MS = 45_000
 
 async function withQbLock<T>(operation: () => Promise<T>): Promise<T> {
   const previous = qbQueue
