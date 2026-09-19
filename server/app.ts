@@ -2031,9 +2031,18 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
   // Only start requiring it from season 2 on, where a title collision with
   // an earlier season is the actual risk this check exists to catch.
   const seasonTag = season > 1 ? `s${String(season).padStart(2, '0')}` : null
+  // The group tag alone proved far too weak: a generic tag like "Remux" matched
+  // an unrelated show's remux from a fuzzy search. The result must actually be
+  // this show, unless its info hash is one SeaDex itself lists for the release.
+  const squash = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const wantedTitle = squash(title)
+  const seadexHashes = new Set((Array.isArray(release.info_hashes) ? release.info_hashes : []).map((hash) => String(hash).toLowerCase()))
+  const hashMatches = (result: ProwlarrRelease) => Boolean(result.infoHash) && seadexHashes.has(String(result.infoHash).toLowerCase())
   const matches = results.filter((result) => {
     if (!result.downloadUrl && !result.magnetUrl) return false
+    if (hashMatches(result)) return true
     const name = String(result.title || '').toLowerCase()
+    if (wantedTitle && !squash(name).includes(wantedTitle)) return false
     if (groupPattern && !groupPattern.test(name)) return false
     if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return false
     return true
@@ -2046,7 +2055,7 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
     log('INFO', `Prowlarr: no match for "${title}"${group ? ` [${release.releaseGroup}]` : ''}${seasonTag ? ` (${seasonTag})` : ''} among ${results.length} search result${results.length === 1 ? '' : 's'} across your configured indexers - falling back to SeaDex`)
     return null
   }
-  matches.sort((left, right) => Number(right.seeders || 0) - Number(left.seeders || 0))
+  matches.sort((left, right) => Number(hashMatches(right)) - Number(hashMatches(left)) || Number(right.seeders || 0) - Number(left.seeders || 0))
   return matches[0]
 }
 

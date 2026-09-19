@@ -1463,6 +1463,29 @@ describe('Prowlarr fallback for private-tracker releases', () => {
     } finally { restore() }
   })
 
+  test('never picks a different show that merely shares a generic group tag', async () => {
+    // Real case: "16bit Sensation: Another Layer" [Remux] downloaded the
+    // seeded remux of an unrelated show, because "Remux" matched any remux.
+    const restore = mockProwlarrSearch([
+      { title: 'Farming Life in Another World S01 Remux [1080p]', protocol: 'torrent', indexer: 'AnimeZ', seeders: 500, downloadUrl: 'http://prowlarr:9696/dl/wrong' },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: '16bit Sensation: Another Layer' }, { releaseGroup: 'Remux' }, 1)
+      assert.equal(result, null)
+    } finally { restore() }
+  })
+
+  test('matches the show title ignoring punctuation, and prefers a SeaDex info-hash match', async () => {
+    const restore = mockProwlarrSearch([
+      { title: '16bit Sensation Another Layer S01 Remux', protocol: 'torrent', indexer: 'AnimeZ', seeders: 50, downloadUrl: 'http://prowlarr:9696/dl/a', infoHash: 'a'.repeat(40) },
+      { title: '16bit Sensation Another Layer S01 Remux', protocol: 'torrent', indexer: 'AnimeZ2', seeders: 1, downloadUrl: 'http://prowlarr:9696/dl/b', infoHash: 'b'.repeat(40) },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: '16bit Sensation: Another Layer' }, { releaseGroup: 'Remux', info_hashes: ['b'.repeat(40)] }, 1)
+      assert.equal(result?.indexer, 'AnimeZ2')
+    } finally { restore() }
+  })
+
   test('returns null when nothing matches the release group', async () => {
     const restore = mockProwlarrSearch([
       { title: 'Some Anime S01 [OtherGroup][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerA', seeders: 5, downloadUrl: 'http://prowlarr:9696/dl/a' },
