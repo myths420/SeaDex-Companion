@@ -94,18 +94,26 @@ export default function BulkDownloadDialog({ open, results, hiddenKeys, busy, ou
   const cancelRef = useRef<HTMLButtonElement>(null)
   const [existingDownloads, setExistingDownloads] = useState<Record<string, boolean>>({})
 
+  // Results are re-fetched every few seconds, which rebuilds `review` and
+  // `hiddenKeys`. Resetting on those wiped the user's unchecked titles and
+  // picks every refresh - so reset only when the dialog opens, reading the
+  // latest values through a ref. Titles that show up later fall back to the
+  // defaults (checked, first option) in the derived state below.
+  const latest = useRef({ review, hiddenKeys })
+  latest.current = { review, hiddenKeys }
   useEffect(() => {
     if (!open) return
+    const { review: current, hiddenKeys: hidden } = latest.current
     // Only single-option groups get an automatic pick. Multi-option groups stay
     // pending (collapsed + highlighted) until the user actively chooses one.
-    setSelected(Object.fromEntries(review.ready.filter((group) => group.options.length === 1).map((group) => [group.id, group.options[0].index])))
-    setEnabled(Object.fromEntries(review.ready.map((group) => [group.id, !hiddenKeys.has(hiddenKey(group.result))])))
+    setSelected(Object.fromEntries(current.ready.filter((group) => group.options.length === 1).map((group) => [group.id, group.options[0].index])))
+    setEnabled(Object.fromEntries(current.ready.map((group) => [group.id, !hidden.has(hiddenKey(group.result))])))
     setExpanded({})
     setExistingDownloads({})
     void api.getAllDownloadProgress().then((response) => setExistingDownloads(Object.fromEntries(Object.entries(response.downloads || {}).filter(([, progress]) => progress.found).map(([key]) => [key, true])))).catch(() => setExistingDownloads({}))
-    setView(review.ready.length ? 'ready' : 'unavailable')
+    setView(current.ready.length ? 'ready' : 'unavailable')
     cancelRef.current?.focus()
-  }, [open, review, hiddenKeys])
+  }, [open])
 
   useEffect(() => {
     if (!open) return
