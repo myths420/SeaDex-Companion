@@ -35,7 +35,7 @@ function buildReview(results: ResultItem[]): Review {
     const excludedParts = new Set(result.excluded_parts || [])
     const byPart = new Map<string, IndexedRelease[]>()
     result.releases.forEach((release, index) => {
-      if (release.kind !== 'best') return
+      if (release.kind !== 'best' || release.is_best === false) return
       const part = release.part || ''
       byPart.set(part, [...(byPart.get(part) || []), { index, release }])
     })

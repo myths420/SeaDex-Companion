@@ -1251,6 +1251,10 @@ export function releaseDict(kind: string, release: JsonObject, part?: string | n
     kind, releaseGroup: release.releaseGroup, tracker: release.tracker, quality: release.quality,
     tags: release.tags || [], dual_audio: Boolean(release.dual_audio), size: release.size || 0,
     info_hashes: [...(release.info_hashes || [])], downloadable: isDownloadable(release),
+    // SeaDex's own Best flag. pickBest falls back to an Alt when nothing is
+    // flagged (e.g. the true best is only a "theoreticalBest" note with no
+    // torrent), so kind === 'best' alone doesn't mean SeaDex recommends it.
+    is_best: Boolean(release.is_best),
   }
   if (part) result.part = part
   if (url) result.url = url
@@ -2732,6 +2736,9 @@ export function bulkDownloadTargets(results?: JsonObject[]): BulkDownloadTarget[
     const excludedParts = new Set((result.excluded_parts || []).map(String))
     for (const [releaseIndex, release] of (result.releases || []).entries()) {
       if (release.kind !== 'best' || !release.downloadable) continue
+      // Results saved before this flag existed have no is_best; only skip
+      // releases SeaDex explicitly did not flag as best.
+      if (release.is_best === false) continue
       if (excludedParts.has(String(release.part || ''))) continue
       const hashes = [...new Set<string>(
         (release.info_hashes || [])

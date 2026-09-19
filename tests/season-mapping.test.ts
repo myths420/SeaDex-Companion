@@ -144,6 +144,18 @@ describe('manual rules and scan history', () => {
     assert.equal(bulkDownloadTargets(applyUserRulesToResults(results, seasonRules)).length, 0)
   })
 
+  test('bulk download skips a release SeaDex did not flag as best (an Alt promoted by the fallback)', () => {
+    const results = [{
+      key: 'series:2', library_key: 'Sonarr:item11', season: 1, status: 'upgrade', arr: 'Sonarr',
+      releases: [
+        { kind: 'best', is_best: false, part: '', downloadable: true, info_hashes: ['a'.repeat(40)] },
+        { kind: 'best', is_best: true, part: '', downloadable: true, info_hashes: ['b'.repeat(40)] },
+        { kind: 'best', part: '', downloadable: true, info_hashes: ['c'.repeat(40)] },
+      ],
+    }]
+    assert.deepEqual(bulkDownloadTargets(results).map((target) => target.hashes[0][0]), ['b', 'c'], 'unflagged-false is skipped; true and legacy (no flag) are kept')
+  })
+
   test('summarizes new upgrades and resolved upgrades between scans', () => {
     const previous = [
       { library_key: 'Sonarr:item1', season: 1, title: 'Resolved', arr: 'Sonarr', status: 'upgrade', best_group: 'A' },

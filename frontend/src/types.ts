@@ -20,6 +20,7 @@ export interface Release {
   size: number
   info_hashes: string[]
   downloadable: boolean
+  is_best?: boolean
   selected_files?: string[]
 }
 
