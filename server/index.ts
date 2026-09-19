@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, exclusionRuleKey, fetchTorrentFile, forgetDownloadSource, forgetOwnedTorrents, MagnetRedirectError,
+  DATA_DIR, DEFAULT_CONFIG, STATIC_DIR, applyUserRulesToResults, arrBaseUrl, autocheckState, buildMagnet, bulkDownloadBatchStatus, bulkDownloadTargets, cancelScan, checkForUpdates, clearScannedData, ensureInLibrary, exclusionRuleKey, fetchTorrentFile, forgetDownloadSource, forgetOwnedTorrents, MagnetRedirectError,
   getDownloadSource, recordDownloadSource,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
@@ -535,6 +535,15 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
           ? 'No magnet available for this release (private tracker), and no matching release was found on Prowlarr'
           : 'No magnet available for this release (private tracker). Configure Prowlarr in Settings to search your indexers for it.',
       })
+    }
+    // A SeaDex title that isn't in Sonarr/Radarr yet: add it there first (no
+    // automatic search) so the finished download has a series/movie to import into.
+    if (found.result!.status === 'new') {
+      try { await ensureInLibrary(config, found.result!) }
+      catch (error) {
+        log('ERROR', `Could not add "${found.result!.title}" to ${found.result!.arr}: ${errorMessage(error)}`)
+        return sendJson(response, 502, { ok: false, error: `Could not add it to ${found.result!.arr}: ${errorMessage(error)}` })
+      }
     }
     const category = String(config[`${String(found.result!.arr).toLowerCase()}_category`] || '').trim()
     const selectedFiles = Array.isArray(found.release!.selected_files) ? found.release!.selected_files.map(String) : []

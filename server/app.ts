@@ -826,7 +826,7 @@ export async function localItems(config: Config, scope: ScanScope = {}): Promise
           sizes_by_episode: episodeSizes ? Object.fromEntries(episodeSizes) : {},
         }
       }
-      if (Object.keys(seasons).length) items.push({ arr: 'Sonarr', id: show.id, title: show.title, slug: show.titleSlug, seasons })
+      if (Object.keys(seasons).length) items.push({ arr: 'Sonarr', id: show.id, title: show.title, slug: show.titleSlug, tvdb_id: show.tvdbId || null, seasons })
     }
   }
   if (config.radarr_url && config.radarr_key) {
@@ -840,7 +840,7 @@ export async function localItems(config: Config, scope: ScanScope = {}): Promise
       if (!(Number.isFinite(inCinemas) && inCinemas <= now) && Number(stats.sizeOnDisk || 0) <= 0) continue
       const groups = stats.releaseGroups || []
       items.push({
-        arr: 'Radarr', id: movie.id, title: movie.title, slug: movie.titleSlug,
+        arr: 'Radarr', id: movie.id, title: movie.title, slug: movie.titleSlug, tmdb_id: movie.tmdbId || null,
         seasons: { 0: { groups, size: stats.sizeOnDisk || 0 } },
       })
     }
@@ -1438,6 +1438,7 @@ export interface ScanDependencies {
   checkpointIntervalMs?: number
   saveScanProgress?: typeof saveScanProgress
   loadScanProgress?: typeof loadScanProgress
+  catalogRows?: (config: Config | JsonObject, best: Map<number, JsonObject>, allResults: JsonObject[], items: JsonObject[]) => Promise<JsonObject[]>
 }
 
 /** How often an in-progress scan's results are written to disk (see the checkpoint comment in runScan). */
@@ -1699,8 +1700,21 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
       checkpoint([...retainedResults, ...results])
     }
     if (controller.signal.aborted) throw new DOMException('Scan cancelled', 'AbortError')
+    // SeaDex titles that aren't in the library at all. Only on a full scan with
+    // every source loaded - otherwise an unreachable Sonarr/Radarr would make
+    // everything in it look "not in library". Tests inject mocks for the
+    // catalogue/library, so the real (networked) step only runs in production.
+    let catalogRows: JsonObject[] = []
+    const catalogStep = dependencies.catalogRows || (dependencies.seadexBest || dependencies.localItems ? null : catalogRowsForScan)
+    if (catalogStep && !scopedKeys.size && !Object.keys(sourceErrors).length && enabledSources.length) {
+      stage = 'listing SeaDex titles not in your library'
+      setState({ message: 'Listing SeaDex titles not in your library…' })
+      try { catalogRows = await catalogStep(config, best, [...retainedResults, ...results], items) }
+      catch (error) { log('WARNING', `Could not list SeaDex titles that are not in your library: ${errorMessage(error)}`) }
+      if (controller.signal.aborted) throw new DOMException('Scan cancelled', 'AbortError')
+    }
     const lastRun = timestamp()
-    const finalResults = applyUserRulesToResults([...retainedResults, ...results], rules)
+    const finalResults = applyUserRulesToResults([...retainedResults, ...results, ...catalogRows], rules)
     setState({ progress: items.length, message: Object.keys(sourceErrors).length ? 'Done with integration errors' : 'Done', results: finalResults, last_run: lastRun, source_errors: sourceErrors })
     stage = 'saving scan results'
     ;(dependencies.saveLastResults || saveLastResults)(finalResults, lastRun)
@@ -1725,7 +1739,7 @@ export async function runScan(config: Config | JsonObject, dependencies: ScanDep
       counts[status] = (counts[status] || 0) + 1
       return counts
     }, {})
-    const statusDetails = ['upgrade', 'best', 'partial', 'missing', 'uncovered']
+    const statusDetails = ['upgrade', 'best', 'partial', 'missing', 'uncovered', 'new']
       .filter((status) => statusCounts[status])
       .map((status) => `${statusCounts[status]} ${status}`)
       .join(', ')
@@ -2815,6 +2829,213 @@ export function indexResultReleases(results: JsonObject[] = resultsForRequest())
 
 export function resultsForRequest(): JsonObject[] {
   return scanState.results.length ? scanState.results : (loadLastResults()?.results || [])
+}
+
+// ---------------------------------------------------------------------------
+// SeaDex titles that are not in the Sonarr/Radarr library
+//
+// SeaDex only knows AniList ids, while Sonarr adds by TVDB id and Radarr by
+// TMDB id, so the Fribb anime-lists mapping bridges them. Titles come from
+// AniList. These show up as status 'new' and are added to Sonarr/Radarr (with
+// no automatic search) only when the user actually downloads one.
+// ---------------------------------------------------------------------------
+export const ANIME_IDS_FILE = join(DATA_DIR, 'anime_ids.json')
+export const CATALOG_META_FILE = join(DATA_DIR, 'catalog_meta.json')
+const ANIME_IDS_URL = 'https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json'
+const ANIME_IDS_MAX_AGE_MS = 7 * 24 * 60 * 60_000
+
+export interface AnimeIds { type: string; tvdb: number | null; tmdbMovie: number | null; tvdbSeason: number | null }
+export interface CatalogMeta { title: string; cover: string | null; banner: string | null }
+
+export function parseAnimeIds(list: JsonObject[]): Map<number, AnimeIds> {
+  const map = new Map<number, AnimeIds>()
+  for (const entry of list) {
+    const alid = Number(entry.anilist_id)
+    if (!alid) continue
+    const movie = entry.themoviedb_id?.movie
+    const tvdbSeason = entry.season?.tvdb
+    map.set(alid, {
+      type: String(entry.type || ''),
+      tvdb: Number(entry.tvdb_id) || null,
+      tmdbMovie: Number(Array.isArray(movie) ? movie[0] : movie) || null,
+      tvdbSeason: Number.isInteger(tvdbSeason) ? tvdbSeason : null,
+    })
+  }
+  return map
+}
+
+async function downloadAnimeIdList(): Promise<JsonObject[]> {
+  // Plain fetch (redirects followed): a public file, and no credentials of ours are sent.
+  const response = await fetch(ANIME_IDS_URL, { signal: AbortSignal.timeout(120_000) })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return await response.json() as JsonObject[]
+}
+
+export async function loadAnimeIds(download: () => Promise<JsonObject[]> = downloadAnimeIdList): Promise<Map<number, AnimeIds>> {
+  const cached = readJson<{ fetchedAt?: number; entries?: Array<[number, AnimeIds]> }>(ANIME_IDS_FILE, {})
+  const fresh = Boolean(cached.fetchedAt && cached.entries?.length && Date.now() - cached.fetchedAt < ANIME_IDS_MAX_AGE_MS)
+  if (!fresh) {
+    try {
+      const map = parseAnimeIds(await download())
+      writeJsonAtomic(ANIME_IDS_FILE, { fetchedAt: Date.now(), entries: [...map] })
+      return map
+    } catch (error) {
+      log('WARNING', `Could not refresh the AniList→TVDB/TMDB id mapping${cached.entries?.length ? ', using the saved copy' : ''}: ${errorMessage(error)}`)
+    }
+  }
+  return new Map(cached.entries || [])
+}
+
+export async function loadCatalogMeta(ids: number[], search: (query: string, variables: JsonObject) => Promise<JsonObject[]> = alSearch): Promise<Map<number, CatalogMeta>> {
+  const stored = readJson<Record<string, CatalogMeta>>(CATALOG_META_FILE, {})
+  const missing = ids.filter((id) => !stored[id])
+  const query = 'query($ids:[Int]){Page(perPage:50){media(id_in:$ids,type:ANIME){id title{romaji english} coverImage{large extraLarge} bannerImage}}}'
+  let changed = false
+  for (let index = 0; index < missing.length; index += 50) {
+    try {
+      for (const media of await search(query, { ids: missing.slice(index, index + 50) })) {
+        const title = media.title?.english || media.title?.romaji
+        if (!title) continue
+        stored[String(media.id)] = { title: String(title), cover: media.coverImage?.extraLarge || media.coverImage?.large || null, banner: media.bannerImage || null }
+        changed = true
+      }
+    } catch (error) {
+      // AniList outages are common; the rest keep a placeholder title and are retried next scan.
+      log('WARNING', `Could not load AniList titles for SeaDex-only entries: ${errorMessage(error)}`)
+      break
+    }
+  }
+  if (changed) writeJsonAtomic(CATALOG_META_FILE, stored)
+  return new Map(Object.entries(stored).map(([id, meta]) => [Number(id), meta]))
+}
+
+export function catalogRowsForUnownedEntries(
+  config: Config | JsonObject, best: Map<number, JsonObject>, ownedAnilistIds: Set<number>,
+  library: { tvdb: Set<number>; tmdb: Set<number> }, ids: Map<number, AnimeIds>, meta: Map<number, CatalogMeta>,
+): { rows: JsonObject[]; noIds: number; noArr: number } {
+  const rows: JsonObject[] = []
+  let noIds = 0
+  let noArr = 0
+  const sonarrOn = Boolean(config.sonarr_url && config.sonarr_key)
+  const radarrOn = Boolean(config.radarr_url && config.radarr_key)
+  for (const [alid, source] of best) {
+    if (ownedAnilistIds.has(alid)) continue
+    const mapped = ids.get(alid)
+    if (!mapped) { noIds += 1; continue }
+    const asMovie = mapped.type === 'MOVIE' && Boolean(mapped.tmdbMovie)
+    const arr = asMovie ? 'Radarr' : 'Sonarr'
+    if (arr === 'Radarr' ? !mapped.tmdbMovie : !mapped.tvdb) { noIds += 1; continue }
+    if (arr === 'Radarr' ? !radarrOn : !sonarrOn) { noArr += 1; continue }
+    // Already in the library under an id the AniList matching missed - not a new title.
+    if (arr === 'Radarr' ? library.tmdb.has(mapped.tmdbMovie!) : library.tvdb.has(mapped.tvdb!)) continue
+    const season = arr === 'Radarr' ? 0 : (mapped.tvdbSeason ?? 1)
+    const slot = seadexSlot(source, season)
+    if (!slot) continue
+    const [selected, alternatives] = pickBest(slot.candidates as ReleaseCandidate[], null)
+    if (!selected) continue
+    const releases = orderedPartReleases(selected, alternatives).map(([kind, release]) => releaseDict(kind, release, null, source.url))
+    const bestGroup = String(selected.releaseGroup || '')
+    const info = meta.get(alid)
+    rows.push({
+      key: `${arr}:${alid}:${season}:${bestGroup}`, group_id: alid, arr, title: info?.title || `AniList #${alid}`, season, have: [],
+      mapping_override: false, have_by_part: {}, owned_by_part: {}, precise_part_ownership: false, local_size_by_part: {},
+      local_size: 0, url: source.url, urls: [{ label: 'releases.moe', url: source.url }], notes: source.notes || '-', notes_by_part: { '': source.notes || '-' },
+      image: info?.cover || null, banner: info?.banner || null, anilist_id: alid, anilist_ids: [alid], arr_url: null, unavailable_parts: [],
+      status: 'new', in_library: false, tvdb_id: mapped.tvdb, tmdb_id: mapped.tmdbMovie,
+      best_group: bestGroup, best_size: selected.size || 0, releases,
+    })
+  }
+  return { rows, noIds, noArr }
+}
+
+async function catalogRowsForScan(config: Config | JsonObject, best: Map<number, JsonObject>, allResults: JsonObject[], items: JsonObject[]): Promise<JsonObject[]> {
+  const owned = new Set<number>()
+  for (const result of allResults) {
+    if (result.anilist_id) owned.add(Number(result.anilist_id))
+    for (const id of result.anilist_ids || []) owned.add(Number(id))
+  }
+  const library = {
+    tvdb: new Set<number>(items.filter((item) => item.tvdb_id).map((item) => Number(item.tvdb_id))),
+    tmdb: new Set<number>(items.filter((item) => item.tmdb_id).map((item) => Number(item.tmdb_id))),
+  }
+  const ids = await loadAnimeIds()
+  if (!ids.size) { log('WARNING', 'Skipping SeaDex titles that are not in your library: no AniList→TVDB/TMDB id mapping available'); return [] }
+  const unowned = [...best.keys()].filter((alid) => !owned.has(alid) && ids.has(alid))
+  const meta = await loadCatalogMeta(unowned)
+  const { rows, noIds, noArr } = catalogRowsForUnownedEntries(config, best, owned, library, ids, meta)
+  log('INFO', `SeaDex titles not in your library: ${rows.length} listed${noIds ? `, ${noIds} skipped (no TVDB/TMDB id known)` : ''}${noArr ? `, ${noArr} skipped (Sonarr/Radarr not configured)` : ''}`)
+  return rows
+}
+
+const arrAddDefaultsCache = new Map<string, { rootFolderPath: string; qualityProfileId: number; languageProfileId?: number }>()
+
+/** Root folder and quality profile most of the existing library already uses. */
+async function arrAddDefaults(config: Config | JsonObject, arr: 'Sonarr' | 'Radarr'): Promise<{ rootFolderPath: string; qualityProfileId: number; languageProfileId?: number }> {
+  const cacheKey = `${arr}:${arrApiUrl(config[`${arr.toLowerCase()}_url`])}`
+  const cached = arrAddDefaultsCache.get(cacheKey)
+  if (cached) return cached
+  const base = arrApiUrl(config[`${arr.toLowerCase()}_url`])
+  const key = String(config[`${arr.toLowerCase()}_key`] || '')
+  const [roots, existing, profiles] = await Promise.all([
+    api(`${base}/rootfolder`, key), api(`${base}/${arr === 'Sonarr' ? 'series' : 'movie'}`, key), api(`${base}/qualityprofile`, key),
+  ]) as [JsonObject[], JsonObject[], JsonObject[]]
+  const rootCounts = new Map<string, number>()
+  const profileCounts = new Map<number, number>()
+  for (const item of existing) {
+    const path = String(item.path || '').toLowerCase()
+    const root = roots.find((candidate) => path.startsWith(String(candidate.path || '').toLowerCase()))
+    if (root) rootCounts.set(String(root.path), (rootCounts.get(String(root.path)) || 0) + 1)
+    if (item.qualityProfileId) profileCounts.set(Number(item.qualityProfileId), (profileCounts.get(Number(item.qualityProfileId)) || 0) + 1)
+  }
+  const top = <T>(counts: Map<T, number>) => [...counts].sort((left, right) => right[1] - left[1])[0]?.[0]
+  const rootFolderPath = top(rootCounts) || String(roots[0]?.path || '')
+  const qualityProfileId = top(profileCounts) || Number(profiles[0]?.id || 0)
+  if (!rootFolderPath || !qualityProfileId) throw new Error(`${arr} has no root folder or quality profile to add new titles to`)
+  const languageProfileId = existing.find((item) => item.languageProfileId)?.languageProfileId
+  const defaults = { rootFolderPath, qualityProfileId, ...(languageProfileId ? { languageProfileId: Number(languageProfileId) } : {}) }
+  arrAddDefaultsCache.set(cacheKey, defaults)
+  return defaults
+}
+
+/**
+ * Makes sure a 'new' (not in library) title exists in Sonarr/Radarr before its
+ * torrent is sent to qBittorrent, so the finished download can be imported.
+ * Nothing is searched for automatically - the only download is the SeaDex one.
+ */
+export async function ensureInLibrary(config: Config | JsonObject, result: JsonObject): Promise<'existing' | 'added' | 'not-needed'> {
+  if (result.status !== 'new') return 'not-needed'
+  const arr = result.arr === 'Radarr' ? 'Radarr' : 'Sonarr'
+  const base = arrApiUrl(config[`${arr.toLowerCase()}_url`])
+  const key = String(config[`${arr.toLowerCase()}_key`] || '')
+  if (!base || !key) throw new Error(`${arr} is not configured, so "${result.title}" cannot be added to it`)
+  if (arr === 'Sonarr') {
+    const tvdbId = Number(result.tvdb_id)
+    if (!tvdbId) throw new Error(`No TVDB id is known for "${result.title}", so it cannot be added to Sonarr`)
+    const already = await api(`${base}/series?tvdbId=${tvdbId}`, key) as JsonObject[]
+    if (already.length) return 'existing'
+    const lookup = (await api(`${base}/series/lookup?term=${encodeURIComponent(`tvdb:${tvdbId}`)}`, key) as JsonObject[])[0]
+    if (!lookup) throw new Error(`Sonarr could not find TVDB id ${tvdbId} ("${result.title}")`)
+    const defaults = await arrAddDefaults(config, 'Sonarr')
+    await api(`${base}/series`, key, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...lookup, ...defaults, monitored: true, seasonFolder: true, seriesType: 'anime', addOptions: { monitor: 'all', searchForMissingEpisodes: false, searchForCutoffUnmetEpisodes: false } }),
+    })
+    log('INFO', `Added "${lookup.title || result.title}" to Sonarr (TVDB ${tvdbId}) - no automatic search`)
+    return 'added'
+  }
+  const tmdbId = Number(result.tmdb_id)
+  if (!tmdbId) throw new Error(`No TMDB id is known for "${result.title}", so it cannot be added to Radarr`)
+  const already = await api(`${base}/movie?tmdbId=${tmdbId}`, key) as JsonObject[]
+  if (already.length) return 'existing'
+  const lookup = await api(`${base}/movie/lookup/tmdb?tmdbId=${tmdbId}`, key) as JsonObject
+  if (!lookup?.tmdbId) throw new Error(`Radarr could not find TMDB id ${tmdbId} ("${result.title}")`)
+  const defaults = await arrAddDefaults(config, 'Radarr')
+  await api(`${base}/movie`, key, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...lookup, ...defaults, monitored: true, minimumAvailability: 'released', addOptions: { monitor: 'movieOnly', searchForMovie: false } }),
+  })
+  log('INFO', `Added "${lookup.title || result.title}" to Radarr (TMDB ${tmdbId}) - no automatic search`)
+  return 'added'
 }
 
 export function resetRuntimeForTests(): void {

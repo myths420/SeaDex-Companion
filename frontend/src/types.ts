@@ -1,4 +1,4 @@
-export type CardStatus = 'upgrade' | 'best' | 'missing' | 'partial'
+export type CardStatus = 'upgrade' | 'best' | 'missing' | 'partial' | 'new'
 
 export type TabId = 'anime' | 'history' | 'config' | 'log'
 
@@ -52,6 +52,7 @@ export interface ResultItem {
   anilist_ids?: number[]
   arr_url: string | null
   library_key?: string
+  in_library?: boolean
   mapping_override?: boolean
   excluded?: boolean
   excluded_parts?: string[]

@@ -53,6 +53,7 @@ const PANEL_GLOW_COLOR: Record<string, string> = {
   best: '[--card-status-color:#34d399]',
   missing: '[--card-status-color:#8b97ab]',
   partial: '[--card-status-color:#fbbf24]',
+  new: '[--card-status-color:#a78bfa]',
 }
 const SOURCE_TONE: Record<string, string> = {
   sonarr: 'border-accent/65 bg-[#0d1c42]/88 text-[#cfe0ff]',
@@ -63,30 +64,35 @@ const STATUS_BADGE: Record<string, string> = {
   best: 'border-good/65 bg-[#062e20]/88 text-[#b9f5dd]',
   missing: 'border-muted/50 bg-[#1e232e]/88 text-[#c3cad6]',
   partial: 'border-warn/65 bg-[#3a2806]/88 text-[#ffe6a8]',
+  new: 'border-purple/65 bg-[#1d1236]/88 text-[#e3d6ff]',
 }
 const SEASON_TONE: Record<string, string> = {
   upgrade: 'bg-canvas-soft',
   best: 'bg-[#0a1712]',
   missing: 'bg-[#141518]',
   partial: 'bg-[#19160d]',
+  new: 'bg-canvas-soft',
 }
 const SEASON_NUMBER_TONE: Record<string, string> = {
   upgrade: 'border-line-strong bg-accent/15 text-accent-bright',
   best: 'border-good/35 bg-good/12 text-good',
   missing: 'border-line-strong bg-accent/15 text-accent-bright',
   partial: 'border-warn/35 bg-warn/12 text-warn',
+  new: 'border-purple/35 bg-purple/12 text-purple',
 }
 const NOTE_TONE: Record<string, string> = {
   upgrade: 'border-line-strong text-muted',
   best: 'border-good/35 text-good',
   missing: 'border-line-strong text-[#9aa5b8]',
   partial: 'border-warn/35 text-warn',
+  new: 'border-line-strong text-muted',
 }
 const NOTES_SURFACE: Record<string, string> = {
   upgrade: 'bg-canvas-soft',
   best: 'bg-[#0a1712]',
   missing: 'bg-[#141518]',
   partial: 'bg-[#19160d]',
+  new: 'bg-canvas-soft',
 }
 const ICON_BUTTON =
   'grid size-9 cursor-pointer place-items-center rounded-control border border-line bg-panel-raised text-muted transition-all duration-150 hover:-translate-y-px hover:border-line-strong hover:text-ink'

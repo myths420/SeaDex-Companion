@@ -62,6 +62,7 @@ export default function AnimeTab({ results, config, status, lastRun, onScan, onC
     partial: allGroups.filter((group) => group.status === 'partial').length,
     missing: allGroups.filter((group) => group.status === 'missing').length,
     best: allGroups.filter((group) => group.status === 'best').length,
+    new: allGroups.filter((group) => group.status === 'new').length,
   }), [allGroups])
 
   const toggleHidden = async (key: string) => {
@@ -84,11 +85,13 @@ export default function AnimeTab({ results, config, status, lastRun, onScan, onC
       if (hiddenKeys.has(cardKey(group)) !== showHidden) return false
       if (arr && group.arr !== arr) return false
       if (statusFilter && group.status !== statusFilter) return false
+      // SeaDex titles that aren't in the library only show under their own filter.
+      if (!statusFilter && group.status === 'new') return false
       if (!query) return true
       const haystack = group.seasons.map((season) => `${season.title} ${season.best_group || ''} ${season.have.join(' ')} ${seasonLabel(season)}`).join(' ')
       return `${group.title} ${haystack}`.toLowerCase().includes(query)
     })
-    const rank: Record<string, number> = { upgrade: 0, partial: 1, missing: 2, best: 3 }
+    const rank: Record<string, number> = { upgrade: 0, partial: 1, missing: 2, best: 3, new: 4 }
     filtered.sort((a, b) => {
       if (sort === 'title') return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })
       if (sort === 'size') return Math.abs(cardDelta(b)) - Math.abs(cardDelta(a)) || a.title.localeCompare(b.title)
@@ -120,11 +123,12 @@ export default function AnimeTab({ results, config, status, lastRun, onScan, onC
     : null
   const clearFilters = () => { setSearch(''); setArr(''); setStatusFilter(''); setSort('recommended'); setShowHidden(false) }
   const statusFilters: { value: string; label: string; count: number; tone: string; icon: IconName }[] = [
-    { value: '', label: 'All', count: allGroups.length, tone: 'text-ink', icon: 'library' },
+    { value: '', label: 'All', count: allGroups.length - counts.new, tone: 'text-ink', icon: 'library' },
     { value: 'upgrade', label: 'Upgradable', count: counts.upgrade, tone: 'text-accent-bright', icon: 'sparkles' },
     { value: 'partial', label: 'Partial', count: counts.partial, tone: 'text-warn', icon: 'alert' },
     { value: 'missing', label: 'Missing', count: counts.missing, tone: 'text-warn', icon: 'alert' },
     { value: 'best', label: 'Best quality', count: counts.best, tone: 'text-good', icon: 'check' },
+    ...(counts.new ? [{ value: 'new', label: 'Not in library', count: counts.new, tone: 'text-purple', icon: 'download' as IconName }] : []),
   ]
 
   const describeBulkFailures = (failures: api.BulkDownloadFailure[]): string => {

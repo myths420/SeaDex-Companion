@@ -6,6 +6,7 @@ export const STATUS_LABEL: Record<CardStatus, string> = {
   best: 'Best quality',
   missing: 'Not on SeaDex',
   partial: 'Partially on SeaDex',
+  new: 'Not in library',
 }
 
 export function formatBytes(n: number): string {
@@ -97,7 +98,8 @@ export function groupResults(results: ResultItem[]): GroupedCard[] {
     const st = g.seasons.map((r) => r.status || 'upgrade')
     const hasUnresolved = st.some((status) => status === 'missing' || status === 'uncovered' || status === 'partial')
     const hasResolved = st.some((status) => status === 'upgrade' || status === 'best')
-    if (st.includes('partial') || (hasUnresolved && hasResolved)) g.status = 'partial'
+    if (st.every((status) => status === 'new')) g.status = 'new'
+    else if (st.includes('partial') || (hasUnresolved && hasResolved)) g.status = 'partial'
     else if (hasUnresolved) g.status = 'missing'
     else if (st.includes('upgrade')) g.status = 'upgrade'
     else g.status = 'best'
