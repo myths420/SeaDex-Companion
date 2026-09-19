@@ -662,9 +662,13 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
         if (!targets.length) return sendJson(response, 400, { ok: false, error: 'None of the selected releases are available any more - rescan and try again' })
         const pending = new Map<string, { category: string; selectedFiles: Set<string>; unrestricted: boolean; item?: JsonObject; releaseIndexes: Array<{ key: string; release: number }> }>()
         const labelsByHash = new Map<string, string[]>()
+        // resultsForRequest() re-reads and parses the whole saved results file
+        // whenever no scan is in memory (e.g. after a restart). Calling it once
+        // per target (~1,400 times) blocked the server for minutes.
+        const resultsByKey = new Map(resultsForRequest().map((entry) => [String(entry.key), entry]))
         for (const target of targets) {
           const category = String(config[`${target.arr.toLowerCase()}_category`] || '').trim()
-          const item = resultsForRequest().find((entry) => entry.key === target.key)
+          const item = resultsByKey.get(target.key)
           const label = `${item?.title || target.key}${target.part ? ` · ${target.part}` : ''}`
           for (const hash of target.hashes) {
             const current = pending.get(hash) || { category, selectedFiles: new Set<string>(), unrestricted: false, item: item as JsonObject | undefined, releaseIndexes: [] }
