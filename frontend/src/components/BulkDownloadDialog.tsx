@@ -120,7 +120,12 @@ export default function BulkDownloadDialog({ open, results, hiddenKeys, busy, ou
     setEnabled(Object.fromEntries(current.ready.map((group) => [group.id, !hidden.has(hiddenKey(group.result))])))
     setExpanded({})
     setExistingDownloads({})
-    void api.getAllDownloadProgress().then((response) => setExistingDownloads(Object.fromEntries(Object.entries(response.downloads || {}).filter(([, progress]) => progress.found).map(([key]) => [key, true])))).catch(() => setExistingDownloads({}))
+    void api.getAllDownloadProgress().then((response) => {
+      const existing = Object.fromEntries(Object.entries(response.downloads || {}).filter(([, progress]) => progress.found).map(([key]) => [key, true]))
+      setExistingDownloads(existing)
+      // Start titles that are already in qBittorrent unchecked (they are never sent anyway).
+      setEnabled((prev) => ({ ...prev, ...Object.fromEntries(current.ready.filter((group) => group.options.some(({ index }) => existing[`${group.result.key}\0${index}`])).map((group) => [group.id, false])) }))
+    }).catch(() => setExistingDownloads({}))
     setView(current.ready.length ? 'ready' : 'unavailable')
     cancelRef.current?.focus()
   }, [open])
