@@ -1486,6 +1486,20 @@ describe('Prowlarr fallback for private-tracker releases', () => {
     } finally { restore() }
   })
 
+  test('rejects a same-title, same-group result whose size differs from the SeaDex release', async () => {
+    const GiB = 1024 ** 3
+    const restore = mockProwlarrSearch([
+      { title: 'Some Anime S01 [Group]', protocol: 'torrent', indexer: 'Wrong', seeders: 99, size: 30 * GiB, downloadUrl: 'http://prowlarr:9696/dl/a' },
+      { title: 'Some Anime S01 [Group]', protocol: 'torrent', indexer: 'Right', seeders: 1, size: 77 * GiB, downloadUrl: 'http://prowlarr:9696/dl/b' },
+    ])
+    try {
+      const result = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group', size: 76 * GiB }, 1)
+      assert.equal(result?.indexer, 'Right')
+      const none = await findProwlarrRelease(prowlarrConfig, { title: 'Some Anime' }, { releaseGroup: 'Group', size: 10 * GiB }, 1)
+      assert.equal(none, null)
+    } finally { restore() }
+  })
+
   test('returns null when nothing matches the release group', async () => {
     const restore = mockProwlarrSearch([
       { title: 'Some Anime S01 [OtherGroup][1080p]', protocol: 'torrent', indexer: 'PrivateTrackerA', seeders: 5, downloadUrl: 'http://prowlarr:9696/dl/a' },

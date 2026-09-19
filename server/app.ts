@@ -2037,13 +2037,19 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
   const squash = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '')
   const wantedTitle = squash(title)
   const seadexHashes = new Set((Array.isArray(release.info_hashes) ? release.info_hashes : []).map((hash) => String(hash).toLowerCase()))
+  const wantedSize = Number(release.size) || 0
+  const subsetOfTorrent = Array.isArray(release.selected_files) && release.selected_files.length > 0
   const hashMatches = (result: ProwlarrRelease) => Boolean(result.infoHash) && seadexHashes.has(String(result.infoHash).toLowerCase())
   const matches = results.filter((result) => {
     if (!result.downloadUrl && !result.magnetUrl) return false
     if (hashMatches(result)) return true
     const name = String(result.title || '').toLowerCase()
     if (wantedTitle && !squash(name).includes(wantedTitle)) return false
-    if (groupPattern && !groupPattern.test(name)) return false
+    if (!groupPattern || !groupPattern.test(name)) return false
+    if (wantedSize > 0 && Number(result.size) > 0) {
+      const size = Number(result.size)
+      if (subsetOfTorrent ? size < wantedSize * 0.9 : Math.abs(size - wantedSize) > wantedSize * 0.1) return false
+    }
     if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return false
     return true
   })
