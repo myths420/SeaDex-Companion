@@ -2066,12 +2066,10 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
     // Results that got past the title check are the interesting near-misses.
     const nearMisses = results.filter((result) => rejection(result) !== 'title' && rejection(result) !== 'no link').slice(0, 3)
       .map((result) => `"${String(result.title).slice(0, 60)}" [${result.indexer}, ${gib(Number(result.size) || 0)}] rejected on ${rejection(result)}`)
-    log('INFO', `Prowlarr: rejected ${[...reasons].map(([reason, count]) => `${reason}=${count}`).join(' ')} (SeaDex wants ${wantedSize ? gib(wantedSize) : 'unknown size'}${subsetOfTorrent ? ' or more' : ''})${nearMisses.length ? `; near misses: ${nearMisses.join('; ')}` : ''}`)
     // Falling back to a SeaDex hash after this is silent otherwise, making a
     // dead-magnet timeout look like Prowlarr never ran at all. Log what
-    // Prowlarr actually returned so a "no matching release" fallback is
-    // distinguishable from "the search itself came back empty."
-    log('INFO', `Prowlarr: no match for "${title}"${group ? ` [${release.releaseGroup}]` : ''}${seasonTag ? ` (${seasonTag})` : ''} among ${results.length} search result${results.length === 1 ? '' : 's'} across your configured indexers - falling back to SeaDex`)
+    // Prowlarr actually returned and why each result was rejected.
+    log('INFO', `Prowlarr: no match for "${title}"${group ? ` [${release.releaseGroup}]` : ''}${seasonTag ? ` (${seasonTag})` : ''} among ${results.length} search result${results.length === 1 ? '' : 's'} (rejected ${[...reasons].map(([reason, count]) => `${reason}=${count}`).join(' ') || 'none'}; SeaDex wants ${wantedSize ? gib(wantedSize) : 'unknown size'}${subsetOfTorrent ? ' or more' : ''})${nearMisses.length ? `; near misses: ${nearMisses.join('; ')}` : ''} - falling back to SeaDex`)
     return null
   }
   matches.sort((left, right) => Number(hashMatches(right)) - Number(hashMatches(left)) || Number(right.seeders || 0) - Number(left.seeders || 0))
