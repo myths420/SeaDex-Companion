@@ -72,6 +72,7 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
   const statusInitialized = useRef(false)
   const lastSeenRun = useRef<string | null>(null)
   const pollGeneration = useRef(0)
+  const lastResultsAt = useRef(0)
   const mounted = useRef(true)
 
   const loadResults = useCallback(async (generation?: number) => {
@@ -97,11 +98,18 @@ function AuthenticatedApp({ username, onLogout, onAccountUpdated }: Authenticate
       if (st.running || st.error || st.cancelled) setScanCompleted(null)
       const completedSinceLastPoll = statusInitialized.current && Boolean(st.last_run) && st.last_run !== lastSeenRun.current
       if ((scanWasRunning.current || completedSinceLastPoll) && !st.running && !st.error && !st.cancelled) setScanCompleted(st.last_run || 'just now')
+      const justFinished = scanWasRunning.current && !st.running
       scanWasRunning.current = st.running
       lastSeenRun.current = st.last_run
       statusInitialized.current = true
       setStatus(st)
-      await loadResults(generation)
+      // The full results list is large (thousands of titles); re-downloading it
+      // every 1.5s during a scan made the page sluggish. While scanning, refresh
+      // it every 20s, and always right when the scan finishes.
+      if (!st.running || justFinished || Date.now() - lastResultsAt.current > 20_000) {
+        lastResultsAt.current = Date.now()
+        await loadResults(generation)
+      }
       if (!mounted.current || generation !== pollGeneration.current) return
       pollTimer.current = window.setTimeout(() => { void pollStatus(generation) }, st.running ? 1500 : 10_000)
     } catch (e) {

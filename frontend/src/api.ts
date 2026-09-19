@@ -2,8 +2,13 @@ import { AuthState, Config, ProwlarrIndexer, ResultItem, ScanHistoryEntry, Scann
 
 export const AUTH_REQUIRED_EVENT = 'seadex:authentication-required'
 
-async function api<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
-  const r = await fetch(path, opts)
+const DEFAULT_TIMEOUT_MS = 30_000
+
+// A request with no timeout that hangs (e.g. the server is busy mid-scan)
+// would stall the status polling chain forever, leaving the page frozen until
+// a manual refresh. `timeoutMs = 0` disables it for the few genuinely long calls.
+async function api<T = any>(path: string, opts: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const r = await fetch(path, timeoutMs > 0 && !opts.signal ? { ...opts, signal: AbortSignal.timeout(timeoutMs) } : opts)
   if (!r.ok) {
     if (r.status === 401 && !path.startsWith('/api/auth/')) {
       window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT))
@@ -269,7 +274,7 @@ export async function bulkDownloads(action: 'start' | 'cancel', selections: Bulk
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, selections, delete_files: deleteFiles }),
-  })
+  }, 0)
   window.dispatchEvent(new CustomEvent(DOWNLOADS_CHANGED_EVENT, { detail: { action, targets: result.targets } }))
   return result
 }
