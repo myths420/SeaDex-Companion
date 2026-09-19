@@ -643,16 +643,23 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
         const byRelease = new Map(availableTargets.map((target) => [`${target.key}\0${target.release}`, target]))
         const selectedParts = new Set<string>()
         const targets = []
+        // With ~1,700 selections, one stale or duplicate entry must not reject
+        // the whole batch (it used to, silently, with nothing in the log) - skip
+        // it and report how many were skipped.
+        let unavailable = 0
+        let duplicates = 0
         for (const selection of data.selections) {
           const key = String(selection?.key || '')
           const release = Number.parseInt(String(selection?.release ?? -1), 10)
           const target = byRelease.get(`${key}\0${release}`)
-          if (!target) return sendJson(response, 400, { ok: false, error: 'A selected bulk release is unavailable' })
+          if (!target) { unavailable += 1; continue }
           const partKey = `${target.key}\0${target.part}`
-          if (selectedParts.has(partKey)) return sendJson(response, 400, { ok: false, error: 'Choose only one best release per season or cour' })
+          if (selectedParts.has(partKey)) { duplicates += 1; continue }
           selectedParts.add(partKey)
           targets.push(target)
         }
+        if (unavailable || duplicates) log('WARNING', `Bulk download: skipped ${unavailable} selection(s) no longer available and ${duplicates} duplicate season/cour selection(s)`)
+        if (!targets.length) return sendJson(response, 400, { ok: false, error: 'None of the selected releases are available any more - rescan and try again' })
         const pending = new Map<string, { category: string; selectedFiles: Set<string>; unrestricted: boolean }>()
         const labelsByHash = new Map<string, string[]>()
         for (const target of targets) {
