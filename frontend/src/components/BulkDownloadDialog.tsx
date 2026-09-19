@@ -49,7 +49,10 @@ function buildReview(results: ResultItem[]): Review {
       const bestGroupNames = new Set(bestReleases.map(({ release }) => release.releaseGroup.toLowerCase()))
       if ([...bestGroupNames].some((name) => ownedGroups.includes(name))) continue
 
-      const downloadable = bestReleases.filter(({ release }) => release.downloadable && release.info_hashes.length > 0)
+      // Dual audio first when several best options exist.
+      const downloadable = bestReleases
+        .filter(({ release }) => release.downloadable && release.info_hashes.length > 0)
+        .sort((a, b) => Number(Boolean(b.release.dual_audio)) - Number(Boolean(a.release.dual_audio)))
       const group = { id: `${result.key}::${part || 'all'}`, result, part, options: downloadable.length ? downloadable : bestReleases }
       if (downloadable.length) ready.push(group)
       else blocked.push(group)
@@ -106,7 +109,14 @@ export default function BulkDownloadDialog({ open, results, hiddenKeys, busy, ou
     const { review: current, hiddenKeys: hidden } = latest.current
     // Only single-option groups get an automatic pick. Multi-option groups stay
     // pending (collapsed + highlighted) until the user actively chooses one.
-    setSelected(Object.fromEntries(current.ready.filter((group) => group.options.length === 1).map((group) => [group.id, group.options[0].index])))
+    // Several best options: pick the dual-audio one automatically when there is
+    // exactly one; otherwise (none, or several) the user still chooses.
+    const autoPick = (group: ReviewGroup) => {
+      if (group.options.length === 1) return group.options[0].index
+      const dual = group.options.filter(({ release }) => release.dual_audio)
+      return dual.length === 1 ? dual[0].index : null
+    }
+    setSelected(Object.fromEntries(current.ready.flatMap((group) => { const pick = autoPick(group); return pick === null ? [] : [[group.id, pick]] })))
     setEnabled(Object.fromEntries(current.ready.map((group) => [group.id, !hidden.has(hiddenKey(group.result))])))
     setExpanded({})
     setExistingDownloads({})
