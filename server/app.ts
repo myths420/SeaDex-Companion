@@ -2410,6 +2410,17 @@ export interface QbBulkAddEntry {
   category?: string
   selectedFiles?: string[]
   timeoutMs?: number
+  /** Optional better source than SeaDex's bare hash (e.g. a Prowlarr match); null/undefined falls back to the hash. */
+  resolve?: () => Promise<QbResolvedSource | null>
+  /** Called after a successful add with the real hash and where it came from. */
+  onAdded?: (hash: string | null, source: string) => void
+}
+
+export interface QbResolvedSource {
+  magnet: string
+  torrentFile?: Buffer
+  knownHash?: string
+  source: string
 }
 
 export interface QbBulkAddFailure {
@@ -2432,7 +2443,10 @@ export interface QbBulkAddOptions {
    */
   onSettle?: (hash: string, error: string | null) => void
   ownership?: QbOwnershipHooks
+  concurrency?: number
 }
+
+const BULK_ADD_CONCURRENCY = 20
 
 /**
  * Adds every torrent individually and swallows per-torrent errors so a single
@@ -2441,23 +2455,47 @@ export interface QbBulkAddOptions {
  * them to the user.
  */
 export async function qbBulkAddTorrents(config: Config, entries: QbBulkAddEntry[], options: QbBulkAddOptions = {}): Promise<QbBulkAddOutcome> {
-  const { onSettle, ownership } = options
+  const { onSettle, ownership, concurrency = BULK_ADD_CONCURRENCY } = options
+  // Adds run in parallel: a torrent waiting on metadata (up to the long
+  // per-torrent budget) used to block every torrent queued behind it, so one
+  // dead magnet stalled a ~1,700-torrent batch for an hour at a time. Only the
+  // brief add step holds the qBittorrent lock, so this is safe.
+  const outcomes: Array<{ error: string | null }> = new Array(entries.length)
+  let next = 0
+  const worker = async () => {
+    while (next < entries.length) {
+      const index = next++
+      const entry = entries[index]
+      const started = Date.now()
+      let error: string | null = null
+      try {
+        let resolved: QbResolvedSource | null = null
+        if (entry.resolve) {
+          try { resolved = await entry.resolve() } catch (caught) { log('WARNING', `Bulk source lookup failed for ${entry.label}, using SeaDex: ${errorMessage(caught)}`) }
+        }
+        // Same as a single download: a display name plus real trackers (a bare
+        // hash magnet shows up as the raw hash and relies on DHT alone).
+        const addedHash = resolved
+          ? await qbAddTorrent(config, resolved.magnet, entry.category, entry.selectedFiles || [], entry.timeoutMs, ownership, resolved.knownHash, resolved.torrentFile)
+          : await qbAddTorrent(config, buildMagnet(entry.hash, entry.label.split(' / ')[0]), entry.category, entry.selectedFiles || [], entry.timeoutMs, ownership, entry.hash)
+        entry.onAdded?.(addedHash, resolved ? resolved.source : 'SeaDex')
+        log('INFO', `Bulk torrent added for ${entry.label} in ${((Date.now() - started) / 1000).toFixed(1)}s (hash: ${entry.hash.slice(0, 8)}…; category: ${entry.category || '-'}; files: ${entry.selectedFiles?.length ? `${entry.selectedFiles.length} selected` : 'all'})`)
+      } catch (caught) {
+        error = errorMessage(caught)
+        log('ERROR', `Bulk download failed for ${entry.label} (${entry.hash}): ${error}`)
+      }
+      outcomes[index] = { error }
+      onSettle?.(entry.hash, error)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, entries.length)) }, worker))
   const added: string[] = []
   const failures: QbBulkAddFailure[] = []
-  for (const entry of entries) {
-    const started = Date.now()
-    let error: string | null = null
-    try {
-      await qbAddTorrent(config, `magnet:?xt=urn:btih:${entry.hash}`, entry.category, entry.selectedFiles || [], entry.timeoutMs, ownership)
-      added.push(entry.hash)
-      log('INFO', `Bulk torrent added for ${entry.label} in ${((Date.now() - started) / 1000).toFixed(1)}s (hash: ${entry.hash.slice(0, 8)}…; category: ${entry.category || '-'}; files: ${entry.selectedFiles?.length ? `${entry.selectedFiles.length} selected` : 'all'})`)
-    } catch (caught) {
-      error = errorMessage(caught)
-      failures.push({ hash: entry.hash, label: entry.label, error })
-      log('ERROR', `Bulk download failed for ${entry.label} (${entry.hash}): ${error}`)
-    }
-    onSettle?.(entry.hash, error)
-  }
+  entries.forEach((entry, index) => {
+    const { error } = outcomes[index]
+    if (error === null) added.push(entry.hash)
+    else failures.push({ hash: entry.hash, label: entry.label, error })
+  })
   return { added, failures }
 }
 

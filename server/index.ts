@@ -660,14 +660,15 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
         }
         if (unavailable || duplicates) log('WARNING', `Bulk download: skipped ${unavailable} selection(s) no longer available and ${duplicates} duplicate season/cour selection(s)`)
         if (!targets.length) return sendJson(response, 400, { ok: false, error: 'None of the selected releases are available any more - rescan and try again' })
-        const pending = new Map<string, { category: string; selectedFiles: Set<string>; unrestricted: boolean }>()
+        const pending = new Map<string, { category: string; selectedFiles: Set<string>; unrestricted: boolean; item?: JsonObject; releaseIndexes: Array<{ key: string; release: number }> }>()
         const labelsByHash = new Map<string, string[]>()
         for (const target of targets) {
           const category = String(config[`${target.arr.toLowerCase()}_category`] || '').trim()
           const item = resultsForRequest().find((entry) => entry.key === target.key)
           const label = `${item?.title || target.key}${target.part ? ` · ${target.part}` : ''}`
           for (const hash of target.hashes) {
-            const current = pending.get(hash) || { category, selectedFiles: new Set<string>(), unrestricted: false }
+            const current = pending.get(hash) || { category, selectedFiles: new Set<string>(), unrestricted: false, item: item as JsonObject | undefined, releaseIndexes: [] }
+            current.releaseIndexes.push({ key: target.key, release: target.release })
             if (target.selectedFiles?.length) for (const file of target.selectedFiles) current.selectedFiles.add(file)
             else current.unrestricted = true
             pending.set(hash, current)
@@ -691,6 +692,26 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
             label: (labelsByHash.get(hash) || [hash]).join(' / '),
             category: target.category,
             selectedFiles: target.unrestricted ? [] : [...target.selectedFiles],
+            // Same source logic as a single download: prefer a real Prowlarr
+            // match (title + group + size checked) over SeaDex's bare hash.
+            resolve: async () => {
+              const first = target.releaseIndexes[0]
+              const release = target.item && Array.isArray(target.item.releases) ? (target.item.releases as JsonObject[])[first.release] : undefined
+              if (!target.item || !release) return null
+              const match = await findProwlarrRelease(config, target.item, release, Number(target.item.season) || 0)
+              if (!match) return null
+              if (match.magnetUrl) return { magnet: match.magnetUrl, knownHash: match.infoHash, source: match.indexer }
+              try {
+                const torrentFile = await fetchTorrentFile(match.downloadUrl!)
+                return { magnet: match.downloadUrl!, torrentFile, knownHash: match.infoHash, source: match.indexer }
+              } catch (error) {
+                if (error instanceof MagnetRedirectError) return { magnet: error.magnet, knownHash: match.infoHash, source: match.indexer }
+                throw error
+              }
+            },
+            onAdded: (addedHash, source) => {
+              for (const ref of target.releaseIndexes) recordDownloadSource(`${ref.key}\0${ref.release}`, { hash: addedHash, source })
+            },
           })), {
             onSettle: (hash, error) => settleBulkDownloadBatch(hash, (labelsByHash.get(hash) || [hash]).join(' / '), error),
             ownership: {

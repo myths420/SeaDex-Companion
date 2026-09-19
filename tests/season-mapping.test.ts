@@ -748,6 +748,10 @@ describe('qBittorrent torrent controls', () => {
 
     assert.ok(requests.some((request) => request.url.endsWith('/api/v2/torrents/add') && new URLSearchParams(request.body).get('urls')?.includes('b'.repeat(40))),
       'the second torrent must still be added after the first one failed')
+    const workingAdd = requests.find((request) => request.url.endsWith('/api/v2/torrents/add') && new URLSearchParams(request.body).get('urls')?.includes('b'.repeat(40)))
+    const workingMagnet = new URLSearchParams(workingAdd!.body).get('urls') || ''
+    assert.match(workingMagnet, /[?&]dn=Working(\+|%20)Torrent/, 'a bulk magnet carries the title as its display name instead of showing up as a bare hash')
+    assert.match(workingMagnet, /[?&]tr=/, 'a bulk magnet carries trackers like a single download does')
     const removal = requests.find((request) => request.url.endsWith('/api/v2/torrents/delete'))
     assert.ok(removal && new URLSearchParams(removal.body).get('hashes') === 'a'.repeat(40))
   })
