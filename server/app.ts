@@ -2044,20 +2044,29 @@ export async function findProwlarrRelease(config: Config, item: JsonObject, rele
   const wantedSize = Number(release.size) || 0
   const subsetOfTorrent = Array.isArray(release.selected_files) && release.selected_files.length > 0
   const hashMatches = (result: ProwlarrRelease) => Boolean(result.infoHash) && seadexHashes.has(String(result.infoHash).toLowerCase())
-  const matches = results.filter((result) => {
-    if (!result.downloadUrl && !result.magnetUrl) return false
-    if (hashMatches(result)) return true
+  // Returns why a result was rejected (checked in this order), or null to accept.
+  const rejection = (result: ProwlarrRelease): string | null => {
+    if (!result.downloadUrl && !result.magnetUrl) return 'no link'
+    if (hashMatches(result)) return null
     const name = String(result.title || '').toLowerCase()
-    if (wantedTitle && !squash(name).includes(wantedTitle)) return false
-    if (!groupPattern || !groupPattern.test(name)) return false
+    if (wantedTitle && !squash(name).includes(wantedTitle)) return 'title'
+    if (!groupPattern || !groupPattern.test(name)) return 'group'
     if (wantedSize > 0 && Number(result.size) > 0) {
       const size = Number(result.size)
-      if (subsetOfTorrent ? size < wantedSize * 0.9 : Math.abs(size - wantedSize) > wantedSize * 0.1) return false
+      if (subsetOfTorrent ? size < wantedSize * 0.9 : Math.abs(size - wantedSize) > wantedSize * 0.1) return 'size'
     }
-    if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return false
-    return true
-  })
+    if (seasonTag && !name.includes(seasonTag) && !name.includes(`season ${season}`)) return 'season'
+    return null
+  }
+  const matches = results.filter((result) => rejection(result) === null)
   if (!matches.length) {
+    const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)}GiB`
+    const reasons = new Map<string, number>()
+    for (const result of results) reasons.set(rejection(result) || '?', (reasons.get(rejection(result) || '?') || 0) + 1)
+    // Results that got past the title check are the interesting near-misses.
+    const nearMisses = results.filter((result) => rejection(result) !== 'title' && rejection(result) !== 'no link').slice(0, 3)
+      .map((result) => `"${String(result.title).slice(0, 60)}" [${result.indexer}, ${gib(Number(result.size) || 0)}] rejected on ${rejection(result)}`)
+    log('INFO', `Prowlarr: rejected ${[...reasons].map(([reason, count]) => `${reason}=${count}`).join(' ')} (SeaDex wants ${wantedSize ? gib(wantedSize) : 'unknown size'}${subsetOfTorrent ? ' or more' : ''})${nearMisses.length ? `; near misses: ${nearMisses.join('; ')}` : ''}`)
     // Falling back to a SeaDex hash after this is silent otherwise, making a
     // dead-magnet timeout look like Prowlarr never ran at all. Log what
     // Prowlarr actually returned so a "no matching release" fallback is
