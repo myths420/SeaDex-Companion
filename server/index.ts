@@ -527,7 +527,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     // stuck at 0 peers indefinitely. Prowlarr's own indexers give a real
     // tracker link (announce + passkey where needed), which resolves far more
     // reliably - so prefer it whenever a match exists.
-    const prowlarrMatch = await findProwlarrRelease(config, found.result!, found.release!, Number(found.result!.season) || 0)
+    const prowlarrMatch = hashes.length > 1 ? null : await findProwlarrRelease(config, found.result!, found.release!, Number(found.result!.season) || 0)
     if (!prowlarrMatch && !hashes.length) {
       return sendJson(response, 400, {
         ok: false,
@@ -698,6 +698,9 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
               const first = target.releaseIndexes[0]
               const release = target.item && Array.isArray(target.item.releases) ? (target.item.releases as JsonObject[])[first.release] : undefined
               if (!target.item || !release) return null
+              // A release SeaDex splits into several torrents (e.g. one per
+              // episode) can't be replaced by one Prowlarr result.
+              if ((Array.isArray(release.info_hashes) ? release.info_hashes.length : 0) > 1) return null
               const match = await findProwlarrRelease(config, target.item, release, Number(target.item.season) || 0)
               if (!match) return null
               if (match.magnetUrl) return { magnet: match.magnetUrl, knownHash: match.infoHash, source: match.indexer }
