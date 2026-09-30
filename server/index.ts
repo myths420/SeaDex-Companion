@@ -8,7 +8,7 @@ import {
   getDownloadSource, recordDownloadSource,
   finishBulkDownloadBatch, findProwlarrRelease, getState, indexResultReleases, listProwlarrIndexers, loadConfig, loadLastResults, loadScanHistory, loadScanProgress, loadUserRules, log, normalizeQbStates, normalizeScanSchedule, ownedTorrentsSnapshot,
   publicConfig, qbAddTorrent, qbBulkAddTorrents, qbControlTorrents, qbGetTorrents, readLogTail, recordOwnedTorrents, resetBulkDownloadBatch,
-  resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
+  resultsForRequest, runScan, saveConfig, saveUserRules, scannedDataInfo, searchAniListTitles, seadexStats, SECRET_CONFIG_KEYS, settleBulkDownloadBatch, setState, testIntegration,
 } from './app.js'
 import {
   AuthError, authState, expiredSessionCookie, isAuthenticated, login, logout, sessionCookie,
@@ -243,7 +243,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   // logs/status without ever touching the login password. Disabled entirely
   // (404, not 401) until a key is actually configured, so it adds no surface
   // for installs that never set one.
-  if (path === '/api/diagnostics/logs' || path === '/api/diagnostics/status') {
+  if (path === '/api/diagnostics/logs' || path === '/api/diagnostics/status' || path === '/api/diagnostics/stats') {
     const configuredKey = String(loadConfig().diagnostics_api_key || '')
     if (!configuredKey) return sendJson(response, 404, { error: 'Not found' })
     const providedKey = String(request.headers['x-diagnostics-key'] || url.searchParams.get('key') || '')
@@ -255,6 +255,12 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       const count = Math.max(1, Math.min(Number.isFinite(requested) ? requested : 500, 2000))
       const lines = readLogTail().slice(-count)
       return sendJson(response, 200, { lines, total: lines.length }, { 'Cache-Control': 'no-store' })
+    }
+    if (path === '/api/diagnostics/stats') {
+      // Public-facing counter data (e.g. an external site showing "SeaDex
+      // Anime - 2500/3000") - deliberately just the two numbers, nothing
+      // else about the library.
+      return sendJson(response, 200, seadexStats(), { 'Cache-Control': 'no-store' })
     }
     const state = getState()
     const scanProgress = state.running ? null : loadScanProgress()

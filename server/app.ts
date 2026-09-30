@@ -2831,6 +2831,34 @@ export function resultsForRequest(): JsonObject[] {
   return scanState.results.length ? scanState.results : (loadLastResults()?.results || [])
 }
 
+/**
+ * Aggregate library coverage by show (not per-season) for a simple public
+ * counter: how many shows in the library SeaDex actually tracks, and how
+ * many of those the library currently owns at best quality. A show counts
+ * as 'best' only when every one of its tracked (non-missing, non-'new')
+ * season results is 'best' - one lagging season keeps the whole show out
+ * of the numerator, matching what an 'upgrade available' badge would say.
+ */
+export function seadexStats(): { tracked: number; best: number } {
+  const byShow = new Map<string, JsonObject[]>()
+  for (const result of resultsForRequest()) {
+    if (result.status === 'new') continue // not in the library
+    const key = String(result.group_id ?? result.anilist_id ?? result.title ?? result.key)
+    const list = byShow.get(key)
+    if (list) list.push(result)
+    else byShow.set(key, [result])
+  }
+  let tracked = 0
+  let best = 0
+  for (const seasons of byShow.values()) {
+    const isTracked = seasons.some((season) => season.status !== 'missing')
+    if (!isTracked) continue
+    tracked++
+    if (seasons.every((season) => season.status === 'best')) best++
+  }
+  return { tracked, best }
+}
+
 // ---------------------------------------------------------------------------
 // SeaDex titles that are not in the Sonarr/Radarr library
 //
