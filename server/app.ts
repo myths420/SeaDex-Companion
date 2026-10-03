@@ -317,7 +317,9 @@ export function loadConfig(): Config {
 export function publicConfig(config: Config): JsonObject {
   const result: JsonObject = { ...config }
   for (const key of SECRET_CONFIG_KEYS) {
-    result[key] = ''
+    // The diagnostics key is only a read-only log/status token and this goes
+    // to the logged-in admin UI only, so it stays visible and copyable.
+    result[key] = key === 'diagnostics_api_key' ? String(config[key] || '') : ''
     result[`${key}_configured`] = Boolean(config[key])
   }
   return result
