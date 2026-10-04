@@ -2474,6 +2474,11 @@ export interface QbBulkAddOptions {
 }
 
 const BULK_ADD_CONCURRENCY = 20
+// A file-scoped bulk add parks its worker until qBittorrent has the magnet
+// metadata. With the single-download 60 minute budget, 20 dead magnets held all
+// 20 workers for an hour and the batch looked like it had stopped adding.
+// Failed ones can simply be bulk-downloaded again later.
+const BULK_METADATA_TIMEOUT_MS = 10 * 60_000
 
 /**
  * Adds every torrent individually and swallows per-torrent errors so a single
@@ -2503,8 +2508,8 @@ export async function qbBulkAddTorrents(config: Config, entries: QbBulkAddEntry[
         // Same as a single download: a display name plus real trackers (a bare
         // hash magnet shows up as the raw hash and relies on DHT alone).
         const addedHash = resolved
-          ? await qbAddTorrent(config, resolved.magnet, entry.category, entry.selectedFiles || [], entry.timeoutMs, ownership, resolved.knownHash, resolved.torrentFile)
-          : await qbAddTorrent(config, buildMagnet(entry.hash, entry.label.split(' / ')[0]), entry.category, entry.selectedFiles || [], entry.timeoutMs, ownership, entry.hash)
+          ? await qbAddTorrent(config, resolved.magnet, entry.category, entry.selectedFiles || [], entry.timeoutMs ?? BULK_METADATA_TIMEOUT_MS, ownership, resolved.knownHash, resolved.torrentFile)
+          : await qbAddTorrent(config, buildMagnet(entry.hash, entry.label.split(' / ')[0]), entry.category, entry.selectedFiles || [], entry.timeoutMs ?? BULK_METADATA_TIMEOUT_MS, ownership, entry.hash)
         entry.onAdded?.(addedHash, resolved ? resolved.source : 'SeaDex')
         log('INFO', `Bulk torrent added for ${entry.label} in ${((Date.now() - started) / 1000).toFixed(1)}s (hash: ${entry.hash.slice(0, 8)}…; category: ${entry.category || '-'}; files: ${entry.selectedFiles?.length ? `${entry.selectedFiles.length} selected` : 'all'})`)
       } catch (caught) {
