@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ChainEntry, ChainPart, Config, JsonObject, ProwlarrIndexer, ProwlarrRelease, ReleaseCandidate, ScanScope, ScanState, ScanTrigger } from './types.js'
 
-export const SEADEX = 'https://releases.moe/api'
+export const SEADEX = 'https://seadex.moe/api'
 export const ANILIST = 'https://graphql.anilist.co'
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
